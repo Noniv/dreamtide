@@ -1,6 +1,7 @@
 import { ParticleSystem } from './particles.js';
-import { SPELLS, BOONS } from './spells.js';
+import { SPELLS, BOONS, EVOLVE } from './spells.js';
 import { audio } from './audio.js';
+import { dustForRun } from './meta.js';
 
 const TAU = Math.PI * 2;
 const rand = (a, b) => a + Math.random() * (b - a);
@@ -43,6 +44,25 @@ const ENEMY_TYPES = {
   },
 };
 
+// ------------------------------------------------------------- wave table
+// Scripted windows instead of a smooth formula: each declares which enemies
+// carry the difficulty, a minimum-alive floor, stepped HP/damage tiers and a
+// scripted event. Past the last window, tiers keep climbing gently.
+const WAVES = [
+  { t: 0, floor: 8, rate: 1.5, types: { wisp: 10 }, hp: 1.0, dmg: 1.0 },
+  { t: 45, floor: 14, rate: 1.15, types: { wisp: 10, bat: 4 }, hp: 1.15, dmg: 1.05, event: 'ring' },
+  { t: 90, floor: 22, rate: 1.0, types: { wisp: 8, bat: 8 }, hp: 1.3, dmg: 1.15 },
+  { t: 135, floor: 30, rate: 0.9, types: { bat: 8, wisp: 5, siren: 2 }, hp: 1.5, dmg: 1.25, event: 'pack' },
+  { t: 180, floor: 40, rate: 0.8, types: { bat: 6, eye: 6, siren: 3 }, hp: 1.8, dmg: 1.35, event: 'wall' },
+  { t: 240, floor: 52, rate: 0.7, types: { eye: 8, bat: 5, siren: 3 }, hp: 2.2, dmg: 1.45, event: 'ring' },
+  { t: 300, floor: 64, rate: 0.6, types: { eye: 6, shade: 6, siren: 3 }, hp: 2.7, dmg: 1.55, event: 'pack' },
+  { t: 360, floor: 78, rate: 0.55, types: { shade: 8, eye: 5, warlock: 2 }, hp: 3.3, dmg: 1.65, event: 'wall' },
+  { t: 420, floor: 92, rate: 0.5, types: { shade: 7, golem: 4, warlock: 3 }, hp: 4.0, dmg: 1.75, event: 'ring' },
+  { t: 480, floor: 106, rate: 0.45, types: { golem: 6, shade: 6, warlock: 3, siren: 2 }, hp: 4.8, dmg: 1.85, event: 'pack' },
+  { t: 540, floor: 120, rate: 0.42, types: { golem: 7, shade: 5, warlock: 4 }, hp: 5.6, dmg: 1.95, event: 'wall' },
+  { t: 600, floor: 135, rate: 0.4, types: { golem: 8, eye: 6, shade: 6, warlock: 4 }, hp: 6.5, dmg: 2.0, event: 'ring' },
+];
+
 export class Engine {
   constructor(canvas, hooks) {
     this.canvas = canvas;
@@ -63,6 +83,17 @@ export class Engine {
     this.meta = (this.hooks.getMeta && this.hooks.getMeta()) || {};
     this.t = 0;
     this._cheated = false;
+    this.banished = new Set();
+    this.banishCharges = 2;
+    this.breather = 0;
+    this.bonusDust = 0;
+    this.banner = null; // { str, color, life, maxLife }
+    this.pickups = [];
+    this.starTimer = 75;
+    this._waveIdx = -1;
+    this._waveEventAt = 0;
+    this._waveEventDone = true;
+    this._goldenAt = 0;
     this.kills = 0;
     this.shake = 0;
     this.hudTimer = 0;
@@ -155,7 +186,12 @@ export class Engine {
 
   // -------------------------------------------------------------- boon math
   dmgMul() { return (1 + 0.12 * (this.player.boons.power || 0)) * (1 + 0.1 * (this.player._genericPower || 0)) * (1 + (this.meta.dmg || 0) / 100); }
-  cdMul() { return 1 / ((1 + 0.1 * (this.player.boons.haste || 0)) * (1 + (this.meta.cast || 0) / 100)); }
+  // "spell haste": all sources add into one pool with natural diminishing
+  // returns — 100 haste halves cooldowns, the next 100 only cuts a third more
+  cdMul() {
+    const haste = (this.player.boons.haste || 0) * 10 + (this.meta.cast || 0);
+    return 1 / (1 + haste / 100);
+  }
   magnetR() { return 90 * (1 + 0.45 * (this.player.boons.magnet || 0)) * (this.player.metaMagnet || 1); }
   aoeMul() { return (1 + 0.1 * (this.player._genericAoe || 0)) * (1 + (this.meta.aoe || 0) / 100); }
   spellMaxLevel(id) { return SPELLS[id].maxLevel + (this.meta.maxLv || 0); }
@@ -201,7 +237,11 @@ export class Engine {
     this.orbitals = [];
     if (!s) return;
     const st = this.spellStats('petals', s.level);
-    for (let i = 0; i < st.count; i++) this.orbitals.push({ a: (i / st.count) * TAU, hitCd: {} });
+    for (let i = 0; i < st.count; i++) this.orbitals.push({ a: (i / st.count) * TAU, hitCd: {}, dir: 1, radF: 1 });
+    // Wild Garden: a second, wider ring waltzing the other way
+    if (s.evolved) {
+      for (let i = 0; i < st.count; i++) this.orbitals.push({ a: (i / st.count) * TAU + TAU / (st.count * 2), hitCd: {}, dir: -1, radF: 1.45 });
+    }
   }
 
   // -------------------------------------------------------------- level ups
@@ -216,52 +256,81 @@ export class Engine {
     }
   }
 
-  offerChoices() {
+  buildChoices() {
     const p = this.player;
     const isStatLevel = p.level % 5 === 0;
+    const banned = (kind, id) => this.banished.has(`${kind}:${id}`);
     const pool = [];
+    const genericPool = () => {
+      pool.push({ kind: 'generic', id: 'power', level: (p._genericPower || 0) + 1 });
+      pool.push({ kind: 'generic', id: 'aoe', level: (p._genericAoe || 0) + 1 });
+      pool.push({ kind: 'generic', id: 'vital', level: (p._genericVital || 0) + 1 });
+    };
+
+    // evolutions: any maxed, un-evolved spell may transcend
+    const evolvePool = [];
+    for (const id of Object.keys(SPELLS)) {
+      const owned = p.spells.find((s) => s.id === id);
+      if (owned && !owned.evolved && owned.level >= this.spellMaxLevel(id) && !banned('spell', id)) {
+        evolvePool.push({ kind: 'evolve', id });
+      }
+    }
 
     if (isStatLevel) {
-      // every 5 levels: only stat boons
       for (const id of Object.keys(BOONS)) {
-        if ((p.boons[id] || 0) < BOONS[id].max) pool.push({ kind: 'boon', id, level: (p.boons[id] || 0) + 1 });
+        if ((p.boons[id] || 0) < BOONS[id].max && !banned('boon', id)) pool.push({ kind: 'boon', id, level: (p.boons[id] || 0) + 1 });
       }
-      // if all boons maxed, offer generic damage amp
-      if (pool.length === 0) {
-        pool.push({ kind: 'generic', id: 'power', level: (p._genericPower || 0) + 1 });
-        pool.push({ kind: 'generic', id: 'aoe', level: (p._genericAoe || 0) + 1 });
-        pool.push({ kind: 'generic', id: 'vital', level: (p._genericVital || 0) + 1 });
-      }
+      if (pool.length === 0) genericPool();
     } else {
-      // regular levels: only spell upgrades
       for (const id of Object.keys(SPELLS)) {
+        if (banned('spell', id)) continue;
         const owned = p.spells.find((s) => s.id === id);
         if (!owned && p.spells.length < 6) pool.push({ kind: 'spell', id, isNew: true });
         else if (owned && owned.level < this.spellMaxLevel(id)) pool.push({ kind: 'spell', id, isNew: false, level: owned.level + 1 });
       }
-      // if pool is empty (all spells maxed), add infinite generic upgrades
-      if (pool.length === 0) {
-        pool.push({ kind: 'generic', id: 'power', level: (p._genericPower || 0) + 1 });
-        pool.push({ kind: 'generic', id: 'aoe', level: (p._genericAoe || 0) + 1 });
-        pool.push({ kind: 'generic', id: 'vital', level: (p._genericVital || 0) + 1 });
-      }
+      if (pool.length === 0 && evolvePool.length === 0) genericPool();
     }
+
     const choices = [];
     const nChoices = this.meta.fourfold ? 4 : 3;
+    // an available evolution always claims one slot — it's the run's big moment
+    if (evolvePool.length && !isStatLevel) choices.push(evolvePool[(Math.random() * evolvePool.length) | 0]);
     while (choices.length < nChoices && pool.length) {
       const i = (Math.random() * pool.length) | 0;
       choices.push(pool.splice(i, 1)[0]);
     }
+    if (choices.length === 0) { genericPool(); choices.push(pool[0]); }
+    return choices;
+  }
+
+  offerChoices() {
     this._levelUpActive = true;
     this.paused = true;
     audio.levelUp();
-    this.hooks.onLevelUp(choices, p.level);
+    this.hooks.onLevelUp(this.buildChoices(), this.player.level, this.banishCharges);
+  }
+
+  banish(choice) {
+    if (this.banishCharges <= 0) return;
+    this.banishCharges--;
+    const kind = choice.kind === 'evolve' ? 'spell' : choice.kind;
+    this.banished.add(`${kind}:${choice.id}`);
+    this.hooks.onLevelUp(this.buildChoices(), this.player.level, this.banishCharges);
   }
 
   chooseUpgrade(choice) {
     if (choice.kind === 'spell') this.addSpell(choice.id);
     else if (choice.kind === 'boon') this.applyBoon(choice.id);
     else if (choice.kind === 'generic') this.applyGeneric(choice.id);
+    else if (choice.kind === 'evolve') {
+      const s = this.player.spells.find((x) => x.id === choice.id);
+      if (s) {
+        s.evolved = true;
+        if (choice.id === 'petals') this.rebuildOrbitals();
+        this.setBanner(`${SPELLS[choice.id].name.toUpperCase()} → ${EVOLVE[choice.id].name.toUpperCase()}`, SPELLS[choice.id].color);
+        this.flash = { color: '255,210,122', a: 0.3 };
+      }
+    }
     audio.choose();
     this._levelUpActive = false;
     this.paused = false;
@@ -282,10 +351,31 @@ export class Engine {
   }
 
   // -------------------------------------------------------------- spawning
+  currentWave() {
+    let idx = 0;
+    for (let i = 0; i < WAVES.length; i++) { if (this.t >= WAVES[i].t) idx = i; else break; }
+    const w = WAVES[idx];
+    if (idx === WAVES.length - 1) {
+      const extra = Math.floor((this.t - w.t) / 60);
+      if (extra > 0) {
+        return {
+          ...w, idx: idx + extra,
+          hp: w.hp + extra * 1.2,
+          floor: Math.min(190, w.floor + extra * 12),
+          event: ['ring', 'wall', 'pack'][extra % 3],
+        };
+      }
+    }
+    return { ...w, idx };
+  }
+
   difficulty() {
-    // smooth ramp: hp & count scale with minutes survived
-    const m = this.t / 60;
-    return { hpMul: 1 + m * 0.4 + m * m * 0.04, spdMul: 1 + Math.min(0.65, m * 0.06), rate: Math.max(0.16, 1.15 - m * 0.11), dmgMul: 1 + m * 0.12 };
+    const w = this.currentWave();
+    return { hpMul: w.hp, spdMul: 1 + Math.min(0.5, this.t * 0.0008), rate: w.rate, dmgMul: w.dmg };
+  }
+
+  setBanner(str, color = '#cdd8ff') {
+    this.banner = { str, color, life: 3, maxLife: 3 };
   }
 
   spawnEnemy(typeId, elite = false, boss = false) {
@@ -303,7 +393,7 @@ export class Engine {
       speed: def.speed * d.spdMul * (elite ? 1.12 : 1) * (boss ? 0.75 : 1),
       dmg: def.dmg * d.dmgMul * (elite ? 1.5 : 1) * (boss ? 1.6 : 1),
       radius: def.radius * (elite ? 1.55 : 1) * (boss ? 3.4 : 1),
-      xp: def.xp * (elite ? 6 : 1),
+      xp: Math.max(1, Math.round(def.xp * (1 + (d.hpMul - 1) * 0.3))) * (elite ? 6 : 1),
       color: def.color, elite,
       slow: 0, slowT: 0, hitFlash: 0, animT: Math.random() * 10, seed: Math.random() * 1000,
       knbx: 0, knby: 0,
@@ -319,32 +409,110 @@ export class Engine {
   }
 
   updateSpawning(dt) {
-    const d = this.difficulty();
-    this.spawnTimer -= dt;
-    const cap = Math.min(230, 26 + this.t * 0.9);
-    if (this.spawnTimer <= 0 && this.enemies.length < cap) {
-      this.spawnTimer = d.rate * rand(0.7, 1.3);
-      // weighted pick by time gates
-      const entries = Object.entries(ENEMY_TYPES).map(([id, def]) => [id, def.weight(this.t)]).filter(([, w]) => w > 0);
-      const total = entries.reduce((s, [, w]) => s + w, 0);
-      let r = Math.random() * total;
-      let chosen = entries[0][0];
-      for (const [id, w] of entries) { r -= w; if (r <= 0) { chosen = id; break; } }
-      const burst = 1 + ((Math.random() * Math.min(5, 1 + this.t / 70)) | 0);
-      for (let i = 0; i < burst; i++) this.spawnEnemy(chosen);
+    const w = this.currentWave();
+    // entering a new window: schedule its event and maybe a golden wisp
+    if (this._waveIdx !== w.idx) {
+      this._waveIdx = w.idx;
+      this._waveEventAt = this.t + rand(12, 30);
+      this._waveEventDone = !w.event;
+      this._goldenAt = Math.random() < 0.35 ? this.t + rand(15, 40) : 0;
     }
+    const pickType = () => {
+      const entries = Object.entries(w.types);
+      const total = entries.reduce((s, [, x]) => s + x, 0);
+      let r = Math.random() * total;
+      for (const [id, x] of entries) { r -= x; if (r <= 0) return id; }
+      return entries[0][0];
+    };
+
+    // breather after a boss falls: the tide recedes
+    if (this.breather > 0) {
+      this.breather -= dt;
+    } else {
+      this.spawnTimer -= dt;
+      const alive = this.enemies.length;
+      if (alive < w.floor && this.spawnTimer <= 0) {
+        // refill quickly up to the wave's floor
+        this.spawnTimer = 0.2;
+        const n = Math.min(6, w.floor - alive);
+        for (let i = 0; i < n; i++) this.spawnEnemy(pickType());
+      } else if (this.spawnTimer <= 0 && alive < 230) {
+        this.spawnTimer = w.rate * rand(0.7, 1.3);
+        const burst = 1 + ((Math.random() * 3) | 0);
+        for (let i = 0; i < burst; i++) this.spawnEnemy(pickType());
+      }
+      if (!this._waveEventDone && this.t >= this._waveEventAt) {
+        this._waveEventDone = true;
+        this.spawnEvent(w.event, pickType);
+      }
+    }
+
+    if (this._goldenAt && this.t >= this._goldenAt) {
+      this._goldenAt = 0;
+      this.spawnGolden();
+    }
+
     this.eliteTimer -= dt;
     if (this.eliteTimer <= 0) {
-      this.eliteTimer = Math.max(18, 38 - this.t / 30);
-      const types = Object.keys(ENEMY_TYPES).filter((id) => ENEMY_TYPES[id].weight(this.t) > 0);
-      this.spawnEnemy(pick(types), true);
+      this.eliteTimer = Math.max(32, 50 - this.t / 40);
+      this.spawnEnemy(pickType(), true);
     }
     this.bossTimer -= dt;
     if (this.bossTimer <= 0) {
-      this.bossTimer = 100;
+      this.bossTimer = 115;
       this.bossCount++;
       this.spawnEnemy('eye', false, true);
     }
+  }
+
+  spawnEvent(kind, pickType) {
+    const p = this.player;
+    if (kind === 'ring') {
+      this.setBanner('THE TIDE ENCIRCLES YOU', '#ff9ad5');
+      const n = 22 + Math.min(18, (this.t / 30) | 0);
+      for (let i = 0; i < n; i++) {
+        const a = (i / n) * TAU;
+        const e = this.spawnEnemy(pickType());
+        e.x = p.x + Math.cos(a) * 560;
+        e.y = p.y + Math.sin(a) * 560;
+      }
+    } else if (kind === 'wall') {
+      this.setBanner('A WALL OF DREAMS ADVANCES', '#8a7bff');
+      const a = rand(0, TAU);
+      const nx = Math.cos(a), ny = Math.sin(a);
+      for (let i = 0; i < 26; i++) {
+        const off = (i - 13) * 55;
+        const e = this.spawnEnemy(pickType());
+        e.x = p.x + nx * 700 - ny * off;
+        e.y = p.y + ny * 700 + nx * off;
+      }
+    } else if (kind === 'pack') {
+      this.setBanner('AN ELITE PACK STIRS', '#ffd27a');
+      const a = rand(0, TAU);
+      const cx = p.x + Math.cos(a) * 620, cy = p.y + Math.sin(a) * 620;
+      const elite = this.spawnEnemy(pickType(), true);
+      elite.x = cx; elite.y = cy;
+      for (let i = 0; i < 8; i++) {
+        const e = this.spawnEnemy(pickType());
+        e.x = cx + rand(-90, 90);
+        e.y = cy + rand(-90, 90);
+      }
+    }
+  }
+
+  spawnGolden() {
+    const d = this.difficulty();
+    const a = rand(0, TAU);
+    const e = {
+      type: 'wisp', golden: true, boss: false, elite: false,
+      x: this.player.x + Math.cos(a) * 480, y: this.player.y + Math.sin(a) * 480,
+      hp: 70 * d.hpMul, maxHp: 70 * d.hpMul,
+      speed: 150, dmg: 0, radius: 14, xp: 4, color: '#ffd27a',
+      slow: 0, slowT: 0, hitFlash: 0, animT: Math.random() * 10, seed: Math.random() * 1000,
+      knbx: 0, knby: 0, goldT: 12,
+    };
+    this.enemies.push(e);
+    this.setBanner('A GOLDEN WISP FLITS PAST', '#ffd27a');
   }
 
   // -------------------------------------------------------------- spells
@@ -417,11 +585,12 @@ export class Engine {
     const visible = this.visibleEnemies().length > 0;
     for (const s of p.spells) {
       const st = this.spellStats(s.id, s.level);
+      st.evolved = !!s.evolved;
       if (s.id === 'petals') continue; // continuous
       s.cd -= dt;
       if (s.cd > 0) continue;
       if (!visible) { s.cd = 0.05; continue; }
-      s.cd = st.cooldown * this.cdMul();
+      s.cd = Math.max(0.12, st.cooldown * this.cdMul());
       this.cast(s.id, st);
       if (this.meta.echo && Math.random() < this.meta.echo / 100) this.cast(s.id, st);
     }
@@ -441,7 +610,7 @@ export class Engine {
             kind: 'arcane', x: p.x, y: p.y - 26,
             vx: Math.cos(a) * st.speed * 0.5, vy: Math.sin(a) * st.speed * 0.5,
             speed: st.speed, dmg: st.damage * this.dmgMul(), life: 2.6, r: 7,
-            turn: 7.5, target,
+            turn: 7.5, target, splinter: st.evolved,
           });
         }
         audio.arcaneCast(rand(-0.4, 0.4));
@@ -460,6 +629,7 @@ export class Engine {
             kind: 'ember', x: p.x, y: p.y - 30, sx: p.x, sy: p.y - 30, tx, ty,
             t: 0, dur: flight, arc: rand(70, 150),
             dmg: st.damage * this.dmgMul(), radius: st.radius * this.aoeMul(), r: 9,
+            burn: st.evolved ? { c1: '#ff8c5a', c2: '#ffd27a', dps: st.damage * this.dmgMul() * 0.4 } : null,
           });
         }
         audio.fireCast();
@@ -468,7 +638,7 @@ export class Engine {
       case 'frost': {
         audio.frostCast();
         const R = st.radius * this.aoeMul();
-        this.zones.push({ kind: 'frostwave', x: p.x, y: p.y, r: 10, maxR: R, life: 0.45, maxLife: 0.45, dmg: st.damage * this.dmgMul(), slow: st.slow, slowDur: st.slowDur, hit: new Set() });
+        this.zones.push({ kind: 'frostwave', x: p.x, y: p.y, r: 10, maxR: R, life: 0.45, maxLife: 0.45, dmg: st.damage * this.dmgMul(), slow: st.evolved ? 1 : st.slow, slowDur: st.slowDur + (st.evolved ? 0.8 : 0), hit: new Set() });
         for (let i = 0; i < 70; i++) {
           const a = rand(0, TAU);
           this.particles.spawn({ x: p.x + Math.cos(a) * 14, y: p.y + Math.sin(a) * 14, vx: Math.cos(a) * rand(180, R * 2.4), vy: Math.sin(a) * rand(180, R * 2.4), life: rand(0.35, 0.7), size: rand(3, 8), endSize: 1, color: '#e8fbff', color2: '#8fe8ff', mode: Math.random() < 0.5 ? 'shard' : 'glow', rotV: rand(-8, 8), drag: 0.88 });
@@ -482,9 +652,11 @@ export class Engine {
         let from = { x: p.x, y: p.y - 34 };
         let cur = first;
         const hitSet = new Set();
-        for (let c = 0; c <= st.chains && cur; c++) {
+        const chains = st.chains + (st.evolved ? 3 : 0);
+        const falloff = st.evolved ? 0.92 : 0.85;
+        for (let c = 0; c <= chains && cur; c++) {
           this.spawnBolt(from.x, from.y, cur.x, cur.y);
-          this.damageEnemy(cur, st.damage * this.dmgMul() * Math.pow(0.85, c), '#bfeaff');
+          this.damageEnemy(cur, st.damage * this.dmgMul() * Math.pow(falloff, c), '#bfeaff');
           hitSet.add(cur);
           for (let i = 0; i < 10; i++) this.particles.spawn({ x: cur.x, y: cur.y, vx: rand(-160, 160), vy: rand(-160, 160), life: rand(0.15, 0.4), size: rand(2, 4), color: '#dff4ff', mode: 'spark', drag: 0.85 });
           from = cur;
@@ -511,16 +683,17 @@ export class Engine {
         const bx = pt ? pt.x : p.x + rand(-220, 220);
         const by = pt ? pt.y : p.y + rand(-220, 220);
         audio.voidCast();
-        this.zones.push({ kind: 'rift', x: bx, y: by, r: riftR, life: st.duration, maxLife: st.duration, dps: st.dps * this.dmgMul(), pull: st.pull, tick: 0, spin: rand(0, TAU) });
+        this.zones.push({ kind: 'rift', x: bx, y: by, r: riftR, life: st.duration, maxLife: st.duration, dps: st.dps * this.dmgMul(), pull: st.pull, tick: 0, spin: rand(0, TAU), evolved: st.evolved });
         break;
       }
       case 'moon': {
         audio.beamHum();
         const target = this.pickTarget(p.x, p.y, 800);
         const a = target ? Math.atan2(target.y - p.y, target.x - p.x) : rand(0, TAU);
+        const beamLife = st.evolved ? 0.75 : 0.5;
         for (let b = 0; b < st.beams; b++) {
           const ang = a + b * Math.PI;
-          this.beams.push({ x: p.x, y: p.y - 20, a: ang, len: st.length, w: st.width, life: 0.5, maxLife: 0.5, dmg: st.damage * this.dmgMul(), hit: new Set() });
+          this.beams.push({ x: p.x, y: p.y - 20, a: ang, len: st.length, w: st.width, life: beamLife, maxLife: beamLife, dmg: st.damage * this.dmgMul(), hit: new Set(), sweep: st.evolved ? (b % 2 ? 1 : -1) * 2.0 : 0 });
         }
         this.shake = Math.min(9, this.shake + 2.5);
         break;
@@ -539,13 +712,14 @@ export class Engine {
             x: tx + rand(-140, -60), y: ty - 560,
             t: 0, dur: rand(0.5, 0.7),
             dmg: st.damage * this.dmgMul(), radius: st.radius * this.aoeMul(),
+            burn: st.evolved ? { c1: '#ffb3f2', c2: '#8a7bff', dps: st.damage * this.dmgMul() * 0.35 } : null,
           });
         }
         break;
       }
       case 'umbra': {
         audio.fangCast();
-        const count = st.count + (this.meta.extraCount || 0);
+        const count = st.count + (this.meta.extraCount || 0) + (st.evolved ? 2 : 0);
         const target = this.pickTarget(p.x, p.y, 640);
         const baseA = target ? Math.atan2(target.y - p.y, target.x - p.x) : rand(0, TAU);
         for (let i = 0; i < count; i++) {
@@ -553,7 +727,7 @@ export class Engine {
           this.projectiles.push({
             kind: 'fang', x: p.x, y: p.y - 18,
             vx: Math.cos(a) * st.speed, vy: Math.sin(a) * st.speed,
-            dmg: st.damage * this.dmgMul(), life: 1.5, r: 12, hit: new Set(),
+            dmg: st.damage * this.dmgMul(), life: 1.5, r: 12, hit: new Set(), chill: st.evolved,
           });
         }
         break;
@@ -568,23 +742,23 @@ export class Engine {
           this.projectiles.push({
             kind: 'glaive', x: p.x, y: p.y - 20, a,
             travelled: 0, range: st.range, speed: st.speed, returning: false,
-            dmg: st.damage * this.dmgMul(), life: 6, r: 14, spin: 0, hitCd: {},
+            dmg: st.damage * this.dmgMul(), life: 6, r: 14, spin: 0, hitCd: {}, evolved: st.evolved,
           });
         }
         break;
       }
       case 'nebula': {
         audio.nebulaCast();
-        const cloudR = st.radius * this.aoeMul();
+        const cloudR = st.radius * this.aoeMul() * (st.evolved ? 1.25 : 1);
         const pt = this.densestPoint(cloudR);
         const bx = pt ? pt.x : p.x + rand(-220, 220);
         const by = pt ? pt.y : p.y + rand(-220, 220);
         const driftA = rand(0, TAU);
         this.zones.push({
-          kind: 'nebula', x: bx, y: by, r: st.radius * this.aoeMul(),
+          kind: 'nebula', x: bx, y: by, r: cloudR,
           life: st.duration, maxLife: st.duration, dps: st.dps * this.dmgMul(),
           tick: 0, dvx: Math.cos(driftA) * 16, dvy: Math.sin(driftA) * 16,
-          seed: rand(0, TAU),
+          seed: rand(0, TAU), evolved: st.evolved,
         });
         break;
       }
@@ -597,6 +771,7 @@ export class Engine {
         this.zones.push({
           kind: 'sigil', x: bx, y: by, r: sigR,
           life: 1.1, maxLife: 1.1, dmg: st.damage * this.dmgMul(), sleepDur: st.sleepDur,
+          echo: st.evolved,
         });
         break;
       }
@@ -608,7 +783,8 @@ export class Engine {
           this.projectiles.push({
             kind: 'lantern', x: p.x + Math.cos(a) * 26, y: p.y - 20 + Math.sin(a) * 26,
             vx: Math.cos(a) * 60, vy: Math.sin(a) * 60 - 40,
-            speed: st.speed, dmg: st.damage * this.dmgMul(), radius: st.radius * this.aoeMul(),
+            speed: st.speed, dmg: st.damage * this.dmgMul() * (st.evolved ? 1.25 : 1),
+            radius: st.radius * this.aoeMul() * (st.evolved ? 1.5 : 1),
             life: 5, r: 8, target: null, ph: rand(0, TAU),
           });
         }
@@ -618,6 +794,8 @@ export class Engine {
         audio.novaCast();
         const R = st.radius * this.aoeMul();
         this.zones.push({ kind: 'novawave', x: p.x, y: p.y, r: 10, maxR: R, life: 0.5, maxLife: 0.5, dmg: st.damage * this.dmgMul(), knock: st.knock, hit: new Set() });
+        // Endless Dusk: a second wave follows the first
+        if (st.evolved) this.zones.push({ kind: 'novawave', x: p.x, y: p.y, r: 10, maxR: R * 1.1, life: 0.5, maxLife: 0.5, delay: 0.35, dmg: st.damage * this.dmgMul() * 0.7, knock: st.knock * 0.7, hit: new Set() });
         this.shake = Math.min(10, this.shake + 3);
         for (let i = 0; i < 50; i++) {
           const a = rand(0, TAU);
@@ -649,9 +827,10 @@ export class Engine {
     const st = this.spellStats('petals', s.level);
     const p = this.player;
     for (const o of this.orbitals) {
-      o.a += st.speed * dt;
-      o.x = p.x + Math.cos(o.a) * st.radius;
-      o.y = p.y + Math.sin(o.a) * st.radius * 0.92;
+      o.a += st.speed * dt * (o.dir || 1);
+      const R = st.radius * (o.radF || 1);
+      o.x = p.x + Math.cos(o.a) * R;
+      o.y = p.y + Math.sin(o.a) * R * 0.92;
       // trail
       if (Math.random() < 0.6) this.particles.spawn({ x: o.x, y: o.y, vx: rand(-15, 15), vy: rand(-25, 5), life: rand(0.3, 0.7), size: rand(2.5, 5), color: Math.random() < 0.5 ? '#7dffb0' : '#ffd1ec', mode: 'petal', rotV: rand(-6, 6), drag: 0.95 });
       for (const e of this.enemies) {
@@ -702,6 +881,14 @@ export class Engine {
       this.flash = { color: '255,210,122', a: 0.4 };
       for (let i = 0; i < 14; i++) this.gems.push({ x: e.x + rand(-70, 70), y: e.y + rand(-70, 70), v: 8, big: true, ph: rand(0, TAU) });
       this.gems.push({ x: e.x, y: e.y, heal: true, ph: 0 });
+      // the tide recedes: a quiet spell to collect and breathe
+      this.breather = 8;
+      this.setBanner('THE TIDE RECEDES', '#7ff5ff');
+    } else if (e.golden) {
+      this.bonusDust += 12;
+      this.setBanner('+12 STARDUST', '#ffd27a');
+      audio.levelUp();
+      for (let i = 0; i < 8; i++) this.gems.push({ x: e.x + rand(-45, 45), y: e.y + rand(-45, 45), v: 5, big: true, ph: rand(0, TAU) });
     } else {
       const drops = e.elite ? 4 : 1;
       for (let i = 0; i < drops; i++) this.gems.push({ x: e.x + rand(-14, 14), y: e.y + rand(-14, 14), v: e.xp, big: e.elite, ph: rand(0, TAU) });
@@ -747,7 +934,7 @@ export class Engine {
       p.dead = true;
       this.paused = true;
       audio.death();
-      this.hooks.onGameOver({ time: this.t, kills: this.kills, level: p.level });
+      this.hooks.onGameOver({ time: this.t, kills: this.kills, level: p.level, bonusDust: this.bonusDust });
     }
   }
 
@@ -788,6 +975,18 @@ export class Engine {
       e.hitFlash = Math.max(0, e.hitFlash - dt);
       e.slowT = Math.max(0, e.slowT - dt);
       const slowMul = e.slowT > 0 ? 1 - e.slow : 1;
+      // golden wisp: flees, never attacks, escapes when its time runs out
+      if (e.golden) {
+        e.goldT -= dt;
+        if (e.goldT <= 0) { e.dead = true; continue; }
+        const fa = Math.atan2(e.y - p.y, e.x - p.x) + Math.sin(e.animT * 4 + e.seed) * 0.6;
+        e.x += (Math.cos(fa) * e.speed + e.knbx) * dt;
+        e.y += (Math.sin(fa) * e.speed + e.knby) * dt;
+        e.knbx *= Math.pow(0.02, dt);
+        e.knby *= Math.pow(0.02, dt);
+        if (Math.random() < 0.5) this.particles.spawn({ x: e.x, y: e.y, vx: rand(-20, 20), vy: rand(-40, -10), life: rand(0.4, 0.8), size: rand(2, 4), color: '#ffd27a', mode: 'star', rotV: rand(-5, 5), drag: 0.94 });
+        continue;
+      }
       const a = Math.atan2(p.y - e.y, p.x - e.x);
       const wob = Math.sin(e.animT * 3 + e.seed) * 0.4;
       const rangedDef = !e.boss && ENEMY_TYPES[e.type].ranged;
@@ -904,6 +1103,18 @@ export class Engine {
           if (dist2(pr.x, pr.y, e.x, e.y) < (e.radius + pr.r) ** 2) {
             this.damageEnemy(e, pr.dmg, '#d9beff');
             for (let i = 0; i < 10; i++) this.particles.spawn({ x: pr.x, y: pr.y, vx: rand(-170, 170), vy: rand(-170, 170), life: rand(0.2, 0.5), size: rand(2, 4), color: '#e6d1ff', mode: 'star', rotV: rand(-6, 6), drag: 0.86 });
+            // Arcane Torrent: splinter into two seeking shards
+            if (pr.splinter) {
+              for (let k = 0; k < 2; k++) {
+                const sa = rand(0, TAU);
+                this.projectiles.push({
+                  kind: 'arcane', x: pr.x, y: pr.y,
+                  vx: Math.cos(sa) * pr.speed * 0.6, vy: Math.sin(sa) * pr.speed * 0.6,
+                  speed: pr.speed, dmg: pr.dmg * 0.4, life: 0.9, r: 5,
+                  turn: 9, target: this.nearestEnemy(pr.x, pr.y, 420, e), splinter: false,
+                });
+              }
+            }
             pr.life = 0;
             break;
           }
@@ -917,6 +1128,7 @@ export class Engine {
         if (f >= 1) {
           pr.life = 0;
           this.explode(pr.tx, pr.ty, pr.radius, pr.dmg);
+          if (pr.burn) this.zones.push({ kind: 'scorch', x: pr.tx, y: pr.ty, r: pr.radius * 0.75, life: 2.5, maxLife: 2.5, dps: pr.burn.dps, tick: 0, c1: pr.burn.c1, c2: pr.burn.c2, seed: rand(0, TAU) });
         } else pr.life = 1;
       } else if (pr.kind === 'comet') {
         if (pr.x0 == null) { pr.x0 = pr.x - pr.tx; pr.y0 = pr.y - pr.ty; }
@@ -928,6 +1140,7 @@ export class Engine {
         if (f >= 1) {
           pr.life = 0;
           this.explode(pr.tx, pr.ty, pr.radius, pr.dmg, { ring: '#ffb3f2', core: '#ffffff', sparks: ['#ffb3f2', '#c48cff', '#8a7bff'], text: '#ffc9f5' });
+          if (pr.burn) this.zones.push({ kind: 'scorch', x: pr.tx, y: pr.ty, r: pr.radius * 0.75, life: 2.5, maxLife: 2.5, dps: pr.burn.dps, tick: 0, c1: pr.burn.c1, c2: pr.burn.c2, seed: rand(0, TAU) });
         } else pr.life = 1;
       } else if (pr.kind === 'fang') {
         pr.life -= dt;
@@ -939,6 +1152,7 @@ export class Engine {
           if (dist2(pr.x, pr.y, e.x, e.y) < (e.radius + pr.r) ** 2) {
             pr.hit.add(e);
             this.damageEnemy(e, pr.dmg, '#c9a4ff');
+            if (pr.chill && !e.boss) { e.slow = Math.max(e.slow, 0.35); e.slowT = Math.max(e.slowT, 1); }
             for (let i = 0; i < 6; i++) this.particles.spawn({ x: e.x, y: e.y, vx: rand(-130, 130), vy: rand(-130, 130), life: rand(0.2, 0.45), size: rand(2, 4), color: '#8a5cd9', mode: 'glow', drag: 0.86 });
           }
         }
@@ -953,7 +1167,12 @@ export class Engine {
           if (pr.travelled >= pr.range) pr.returning = true;
         } else {
           const D = Math.hypot(p2.x - pr.x, p2.y - pr.y - 20) || 1;
-          if (D < 30) { pr.life = 0; continue; }
+          if (D < 30) {
+            pr.life = 0;
+            // Star Sovereign: the returning glaive bursts into stardust
+            if (pr.evolved) this.explode(p2.x, p2.y - 20, 110, pr.dmg * 1.2, { ring: '#9fd8ff', core: '#e8f6ff', sparks: ['#9fd8ff', '#e8f6ff', '#ffffff'], text: '#bfe4ff', quiet: true });
+            continue;
+          }
           pr.x += ((p2.x - pr.x) / D) * pr.speed * 1.15 * dt;
           pr.y += ((p2.y - 20 - pr.y) / D) * pr.speed * 1.15 * dt;
         }
@@ -997,6 +1216,7 @@ export class Engine {
     // zones
     for (const z of this.zones) {
       z.life -= dt;
+      if (z.delay && z.delay > 0) { z.delay -= dt; z.life += dt; continue; }
       if (z.kind === 'frostwave') {
         const f = 1 - z.life / z.maxLife;
         z.r = 10 + (z.maxR - 10) * f;
@@ -1015,6 +1235,11 @@ export class Engine {
       } else if (z.kind === 'rift') {
         z.spin += dt * 3.2;
         z.tick -= dt;
+        // Event Horizon: the rift collapses in a burst when it closes
+        if (z.evolved && z.life <= 0 && !z.boomed) {
+          z.boomed = true;
+          this.explode(z.x, z.y, z.r * 1.3, z.dps * 3, { ring: '#9a5cff', core: '#e6d1ff', sparks: ['#9a5cff', '#ff9ad5', '#c9a4ff'], text: '#c9a4ff', quiet: true });
+        }
         // swirl particles inward
         for (let i = 0; i < 3; i++) {
           const a = rand(0, TAU);
@@ -1023,12 +1248,13 @@ export class Engine {
           this.particles.spawn({ x: px, y: py, vx: (z.x - px) * 1.6 + -Math.sin(a) * 90, vy: (z.y - py) * 1.6 + Math.cos(a) * 90, life: rand(0.4, 0.8), size: rand(2, 5), color: Math.random() < 0.5 ? '#9a5cff' : '#ff9ad5', mode: 'glow', drag: 0.97 });
         }
         for (const e of this.enemies) {
-          if (e.dead || e.boss) continue;
+          if (e.dead || (e.boss && !z.evolved)) continue;
           const dd = dist2(z.x, z.y, e.x, e.y);
           if (dd < (z.r * 1.6) ** 2 && dd > 4) {
             const D = Math.sqrt(dd);
-            e.x += ((z.x - e.x) / D) * z.pull * dt;
-            e.y += ((z.y - e.y) / D) * z.pull * dt;
+            const pull = z.pull * (e.boss ? 0.35 : 1);
+            e.x += ((z.x - e.x) / D) * pull * dt;
+            e.y += ((z.y - e.y) / D) * pull * dt;
           }
         }
         if (z.tick <= 0) {
@@ -1039,8 +1265,14 @@ export class Engine {
           }
         }
       } else if (z.kind === 'nebula') {
-        z.x += z.dvx * dt;
-        z.y += z.dvy * dt;
+        if (z.evolved) {
+          // Genesis Cloud follows its maker
+          const D = Math.hypot(p.x - z.x, p.y - z.y) || 1;
+          if (D > 40) { z.x += ((p.x - z.x) / D) * 42 * dt; z.y += ((p.y - z.y) / D) * 42 * dt; }
+        } else {
+          z.x += z.dvx * dt;
+          z.y += z.dvy * dt;
+        }
         z.tick -= dt;
         // slow star-mist sparkle inside, plus glints orbiting the rim so the
         // true edge stays readable without an outline
@@ -1076,6 +1308,21 @@ export class Engine {
               if (!e.boss) { e.slow = 0.92; e.slowT = z.sleepDur; }
             }
           }
+          // The Great Seal sounds twice
+          if (z.echo && !z.echoed) { z.echoed = true; z.life = 0.9; }
+        }
+      } else if (z.kind === 'scorch') {
+        z.tick -= dt;
+        if (Math.random() < 0.6) {
+          const a = rand(0, TAU), R = z.r * Math.sqrt(Math.random());
+          this.particles.spawn({ x: z.x + Math.cos(a) * R, y: z.y + Math.sin(a) * R, vx: rand(-8, 8), vy: rand(-45, -15), life: rand(0.3, 0.7), size: rand(2, 5), endSize: 0.5, color: z.c1, color2: z.c2, mode: 'glow', drag: 0.94 });
+        }
+        if (z.tick <= 0) {
+          z.tick = 0.3;
+          for (const e of this.enemies) {
+            if (e.dead) continue;
+            if (dist2(z.x, z.y, e.x, e.y) < (z.r + e.radius) ** 2) this.damageEnemy(e, z.dps * 0.3, z.c2);
+          }
         }
       } else if (z.kind === 'novawave') {
         const f = 1 - z.life / z.maxLife;
@@ -1099,6 +1346,7 @@ export class Engine {
     // beams
     for (const b of this.beams) {
       b.life -= dt;
+      if (b.sweep) b.a += b.sweep * dt;
       const ca = Math.cos(b.a), sa = Math.sin(b.a);
       for (const e of this.enemies) {
         if (e.dead || b.hit.has(e)) continue;
@@ -1151,6 +1399,48 @@ export class Engine {
     this.gems = this.gems.filter((g) => !g.taken);
     if (this.gems.length > 400) this.gems.splice(0, this.gems.length - 400);
 
+    // fallen stars (map pickups)
+    this.starTimer -= dt;
+    if (this.starTimer <= 0) {
+      this.starTimer = rand(75, 110);
+      const a = rand(0, TAU);
+      this.pickups.push({
+        x: p.x + Math.cos(a) * rand(650, 900), y: p.y + Math.sin(a) * rand(650, 900),
+        life: 20, ph: rand(0, TAU), kind: pick(['heal', 'gems', 'dust']),
+      });
+      this.setBanner('A STAR HAS FALLEN NEARBY', '#7ff5ff');
+    }
+    for (const s of this.pickups) {
+      s.life -= dt;
+      s.ph += dt * 3;
+      if (dist2(s.x, s.y, p.x, p.y) < 34 * 34) {
+        s.taken = true;
+        audio.levelUp();
+        if (s.kind === 'heal') {
+          p.hp = Math.min(p.maxHp, p.hp + p.maxHp * 0.35);
+          this.texts.push({ x: p.x, y: p.y - 44, str: '+life', color: '#7dffb0', life: 1, vy: -40, size: 16 });
+        } else if (s.kind === 'gems') {
+          const d2 = this.difficulty();
+          const v = Math.max(2, Math.round(3 * d2.hpMul));
+          for (let i = 0; i < 10; i++) this.gems.push({ x: s.x + rand(-60, 60), y: s.y + rand(-60, 60), v, big: true, ph: rand(0, TAU) });
+        } else {
+          this.bonusDust += 10;
+          this.texts.push({ x: p.x, y: p.y - 44, str: '+10 stardust', color: '#ffd27a', life: 1, vy: -40, size: 16 });
+        }
+        for (let i = 0; i < 40; i++) {
+          const a2 = rand(0, TAU);
+          this.particles.spawn({ x: s.x, y: s.y, vx: Math.cos(a2) * rand(80, 320), vy: Math.sin(a2) * rand(80, 320), life: rand(0.4, 0.9), size: rand(2, 5), color: '#7ff5ff', color2: '#ffd27a', mode: 'star', rotV: rand(-6, 6), drag: 0.9 });
+        }
+      }
+    }
+    this.pickups = this.pickups.filter((s) => !s.taken && s.life > 0);
+
+    // banner
+    if (this.banner) {
+      this.banner.life -= dt;
+      if (this.banner.life <= 0) this.banner = null;
+    }
+
     // texts
     for (const t of this.texts) { t.life -= dt; t.y += t.vy * dt; }
     this.texts = this.texts.filter((t) => t.life > 0);
@@ -1197,8 +1487,9 @@ export class Engine {
     this.hooks.onHud({
       hp: p.hp, maxHp: p.maxHp, xp: p.xp, xpNext: p.xpNext, level: p.level,
       time: this.t, kills: this.kills,
-      spells: p.spells.map((s) => ({ id: s.id, level: s.level })),
+      spells: p.spells.map((s) => ({ id: s.id, level: s.level, evolved: !!s.evolved })),
       boons: { ...p.boons },
+      dust: dustForRun({ kills: this.kills, level: p.level, time: this.t, bonusDust: this.bonusDust }, this.meta),
       paused: this.paused,
     }, force);
   }
@@ -1260,6 +1551,9 @@ export class Engine {
     // gems
     for (const g of this.gems) this.drawGem(ctx, cam, g);
 
+    // fallen stars
+    for (const s of this.pickups) this.drawPickup(ctx, cam, s);
+
     // enemies
     for (const e of this.enemies) this.drawEnemy(ctx, cam, e);
 
@@ -1302,10 +1596,95 @@ export class Engine {
     ctx.fillStyle = vg;
     ctx.fillRect(0, 0, w, h);
 
+    // edge arrows toward off-screen fallen stars
+    for (const s of this.pickups) {
+      const sx = s.x - camX, sy = s.y - camY;
+      if (sx >= 0 && sx <= w && sy >= 0 && sy <= h) continue;
+      const ax = clamp(sx, 46, w - 46), ay = clamp(sy, 46, h - 46);
+      const ang = Math.atan2(sy - ay, sx - ax);
+      ctx.save();
+      ctx.translate(ax, ay);
+      ctx.rotate(ang);
+      ctx.globalAlpha = 0.55 + 0.3 * Math.sin(this.t * 5);
+      ctx.fillStyle = '#7ff5ff';
+      ctx.shadowColor = '#7ff5ff';
+      ctx.shadowBlur = 10;
+      ctx.beginPath();
+      ctx.moveTo(14, 0);
+      ctx.lineTo(-8, -8);
+      ctx.lineTo(-4, 0);
+      ctx.lineTo(-8, 8);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+    }
+
+    // event banner
+    if (this.banner) {
+      const b = this.banner;
+      const a = Math.min(1, b.life, (b.maxLife - b.life) * 3);
+      ctx.save();
+      ctx.globalAlpha = a;
+      ctx.textAlign = 'center';
+      ctx.font = '700 24px Cinzel, serif';
+      ctx.fillStyle = b.color;
+      ctx.shadowColor = b.color;
+      ctx.shadowBlur = 18;
+      ctx.fillText(b.str, w / 2, 118);
+      ctx.restore();
+    }
+
     if (this.flash) {
       ctx.fillStyle = `rgba(${this.flash.color},${Math.max(0, this.flash.a)})`;
       ctx.fillRect(0, 0, w, h);
     }
+  }
+
+  drawPickup(ctx, cam, s) {
+    const x = s.x - cam.x, y = s.y - cam.y;
+    if (x < -60 || y < -60 || x > cam.w + 60 || y > cam.h + 60) return;
+    const urgent = s.life < 5 ? 0.5 + 0.5 * Math.sin(this.t * 10) : 1;
+    ctx.save();
+    ctx.globalCompositeOperation = 'lighter';
+    ctx.globalAlpha = urgent;
+    // beacon column
+    const beam = ctx.createLinearGradient(x, y - 190, x, y);
+    beam.addColorStop(0, 'rgba(127,245,255,0)');
+    beam.addColorStop(1, 'rgba(127,245,255,0.3)');
+    ctx.fillStyle = beam;
+    ctx.fillRect(x - 7, y - 190, 14, 190);
+    // ground ring
+    ctx.strokeStyle = '#7ff5ff';
+    ctx.lineWidth = 1.6;
+    ctx.globalAlpha = 0.5 * urgent;
+    ctx.beginPath();
+    ctx.ellipse(x, y + 6, 22 + Math.sin(s.ph) * 3, 8, 0, 0, TAU);
+    ctx.stroke();
+    // the star itself
+    ctx.globalAlpha = urgent;
+    const g = ctx.createRadialGradient(x, y - 8, 0, x, y - 8, 26);
+    g.addColorStop(0, '#ffffff');
+    g.addColorStop(0.4, '#7ff5ff');
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(x, y - 8, 26, 0, TAU);
+    ctx.fill();
+    ctx.fillStyle = '#eafeff';
+    ctx.save();
+    ctx.translate(x, y - 8);
+    ctx.rotate(s.ph * 0.6);
+    ctx.beginPath();
+    for (let k = 0; k < 5; k++) {
+      const a = (k / 5) * TAU - Math.PI / 2;
+      const a2 = a + TAU / 10;
+      ctx.lineTo(Math.cos(a) * 10, Math.sin(a) * 10);
+      ctx.lineTo(Math.cos(a2) * 4.2, Math.sin(a2) * 4.2);
+    }
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+    ctx.restore();
   }
 
   drawGem(ctx, cam, g) {
@@ -1464,7 +1843,23 @@ export class Engine {
       ctx.stroke();
       ctx.restore();
       ctx.restore();
+    } else if (z.kind === 'scorch') {
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      const fade = Math.min(1, z.life * 1.2, (z.maxLife - z.life) * 4);
+      const flick = 0.85 + 0.15 * Math.sin(this.t * 9 + z.seed);
+      ctx.globalAlpha = 0.2 * fade * flick;
+      const g = ctx.createRadialGradient(x, y, 0, x, y, z.r);
+      g.addColorStop(0, z.c1);
+      g.addColorStop(0.7, z.c2);
+      g.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(x, y, z.r, 0, TAU);
+      ctx.fill();
+      ctx.restore();
     } else if (z.kind === 'novawave') {
+      if (z.delay && z.delay > 0) return;
       ctx.save();
       ctx.globalCompositeOperation = 'lighter';
       const t = z.life / z.maxLife;
@@ -1723,21 +2118,49 @@ export class Engine {
   }
 
   drawBossProjectile(ctx, cam, bp) {
+    // enemy shots get a unique silhouette — a jagged dark dart with a red
+    // core — so threats never read like friendly sparkles
     if (bp.life <= 0) return;
     const x = bp.x - cam.x, y = bp.y - cam.y;
+    if (x < -30 || y < -30 || x > cam.w + 30 || y > cam.h + 30) return;
+    const a = Math.atan2(bp.vy, bp.vx);
+    const s = bp.r / 6; // scale relative to the old 6px radius
     ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(a);
+    // hot red halo (small, so the dark body still silhouettes)
     ctx.globalCompositeOperation = 'lighter';
-    const g = ctx.createRadialGradient(x, y, 0, x, y, bp.r * 2);
-    g.addColorStop(0, bp.color || '#ff5a7a');
-    g.addColorStop(0.5, '#c48cff');
+    const g = ctx.createRadialGradient(0, 0, 0, 0, 0, 14 * s);
+    g.addColorStop(0, 'rgba(255,60,70,0.55)');
     g.addColorStop(1, 'rgba(0,0,0,0)');
     ctx.fillStyle = g;
     ctx.beginPath();
-    ctx.arc(x, y, bp.r * 2, 0, TAU);
+    ctx.arc(0, 0, 14 * s, 0, TAU);
     ctx.fill();
-    ctx.fillStyle = '#ffbad5';
+    ctx.globalCompositeOperation = 'source-over';
+    // jagged dark dart body with a pale rim
+    ctx.scale(s, s);
+    ctx.fillStyle = '#1a0a14';
+    ctx.strokeStyle = 'rgba(255,190,200,0.9)';
+    ctx.lineWidth = 1.2;
     ctx.beginPath();
-    ctx.arc(x, y, bp.r * 0.5, 0, TAU);
+    ctx.moveTo(11, 0);
+    ctx.lineTo(2, -3);
+    ctx.lineTo(-2, -6);
+    ctx.lineTo(-4, -2);
+    ctx.lineTo(-9, 0);
+    ctx.lineTo(-4, 2);
+    ctx.lineTo(-2, 6);
+    ctx.lineTo(2, 3);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+    // burning red core
+    ctx.fillStyle = '#ff2e44';
+    ctx.shadowColor = '#ff2e44';
+    ctx.shadowBlur = 8;
+    ctx.beginPath();
+    ctx.arc(0.5, 0, 2.4, 0, TAU);
     ctx.fill();
     ctx.restore();
   }
@@ -1877,7 +2300,7 @@ export class Engine {
     ctx.ellipse(0, e.radius * 0.55, e.radius * 0.85, e.radius * 0.3, 0, 0, TAU);
     ctx.fill();
 
-    if (e.elite) {
+    if (e.elite || e.golden) {
       ctx.save();
       ctx.globalCompositeOperation = 'lighter';
       ctx.strokeStyle = 'rgba(255,210,122,0.6)';
@@ -1890,7 +2313,7 @@ export class Engine {
       ctx.restore();
     }
 
-    const bodyTint = flash ? '#ffffff' : frozen ? mixHint(e.color) : null;
+    const bodyTint = flash ? '#ffffff' : frozen ? mixHint(e.color) : e.golden ? '#ffe9a8' : null;
     const sc = e.boss ? e.radius / 18 : e.radius / ENEMY_TYPES[e.type].radius;
     ctx.scale(sc, sc);
 

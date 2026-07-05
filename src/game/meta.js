@@ -52,16 +52,16 @@ const ARMS = {
   tempo: {
     angle: -30,
     fx: [
-      { name: 'Quick Breath', desc: '+3% casting speed', fx: { cast: 3 } },
-      { name: 'Quick Breath', desc: '+3% casting speed', fx: { cast: 3 } },
+      { name: 'Quick Breath', desc: '+3% spell haste', fx: { cast: 3 } },
+      { name: 'Quick Breath', desc: '+3% spell haste', fx: { cast: 3 } },
       { name: 'Feather Step', desc: '+4% move speed', fx: { speed: 4 } },
-      { name: 'Racing Pulse', desc: '+8% casting speed', fx: { cast: 8 }, kind: 'notable' },
+      { name: 'Racing Pulse', desc: '+8% spell haste', fx: { cast: 8 }, kind: 'notable' },
       { name: 'Feather Step', desc: '+4% move speed', fx: { speed: 4 } },
-      { name: 'Quick Breath', desc: '+4% casting speed', fx: { cast: 4 } },
-      { name: 'Slipstream', desc: '+4% cast & move speed', fx: { cast: 4, speed: 4 } },
-      { name: 'Tidal Rhythm', desc: '+9% casting speed', fx: { cast: 9 }, kind: 'notable' },
+      { name: 'Quick Breath', desc: '+4% spell haste', fx: { cast: 4 } },
+      { name: 'Slipstream', desc: '+4% spell haste & move speed', fx: { cast: 4, speed: 4 } },
+      { name: 'Tidal Rhythm', desc: '+9% spell haste', fx: { cast: 9 }, kind: 'notable' },
     ],
-    branch: { name: 'Timeweaver', desc: '+15% casting speed', fx: { cast: 15 }, cost: 600 },
+    branch: { name: 'Timeweaver', desc: '+15% spell haste', fx: { cast: 15 }, cost: 600 },
     end: { name: 'Echoing Thought', desc: '10% chance to cast every spell twice', fx: { echo: 10 }, cost: 2600 },
   },
   cosmos: {
@@ -113,12 +113,12 @@ const ARMS = {
     angle: -90,
     fx: [
       { name: 'Clear Sight', desc: '+3% damage, +3% area', fx: { dmg: 3, aoe: 3 } },
-      { name: 'Dream Logic', desc: '+3% cast speed, +4% essence', fx: { cast: 3, xp: 4 } },
-      { name: 'Clear Sight', desc: '+3% damage, +3% cast speed', fx: { dmg: 3, cast: 3 } },
+      { name: 'Dream Logic', desc: '+3% spell haste, +4% essence', fx: { cast: 3, xp: 4 } },
+      { name: 'Clear Sight', desc: '+3% damage, +3% spell haste', fx: { dmg: 3, cast: 3 } },
       { name: 'Woven Fate', desc: '+5% damage, +5% area', fx: { dmg: 5, aoe: 5 }, kind: 'notable' },
-      { name: 'Dream Logic', desc: '+4% cast speed, +4% essence', fx: { cast: 4, xp: 4 } },
+      { name: 'Dream Logic', desc: '+4% spell haste, +4% essence', fx: { cast: 4, xp: 4 } },
       { name: 'Clear Sight', desc: '+4% damage, +3% area', fx: { dmg: 4, aoe: 3 } },
-      { name: 'Threads Converge', desc: '+4% damage, +4% cast speed', fx: { dmg: 4, cast: 4 } },
+      { name: 'Threads Converge', desc: '+4% damage, +4% spell haste', fx: { dmg: 4, cast: 4 } },
       { name: 'Loom of Nights', desc: '+6% damage, +6% area', fx: { dmg: 6, aoe: 6 }, kind: 'notable' },
     ],
     branch: { name: 'Stargrave', desc: 'Slain foes burst, wounding those nearby', fx: { deathBurst: 1 }, cost: 700 },
@@ -158,7 +158,7 @@ const ARM_KEYS = Object.keys(ARMS);
 const ARM_KEYS_SORTED = [...ARM_KEYS].sort((a, b) => ARMS[a].angle - ARMS[b].angle);
 const RING_FX = [
   { name: 'Faint Star', desc: '+3% spell damage', fx: { dmg: 3 } },
-  { name: 'Faint Star', desc: '+2% casting speed', fx: { cast: 2 } },
+  { name: 'Faint Star', desc: '+2% spell haste', fx: { cast: 2 } },
   { name: 'Faint Star', desc: '+3% area of effect', fx: { aoe: 3 } },
   { name: 'Faint Star', desc: '+8 max life', fx: { hp: 8 } },
 ];
@@ -187,11 +187,11 @@ function schoolSmall(school, i) {
   const s = SCHOOLS[school];
   const kinds = [
     { desc: `+6% ${s.theme} damage`, fx: { school, sdmg: 6 } },
-    { desc: `+4% ${s.theme} casting speed`, fx: { school, scd: 4 } },
+    { desc: `+4% ${s.theme} spell haste`, fx: { school, scd: 4 } },
     { desc: `+6% ${s.theme} area`, fx: { school, saoe: 6 } },
     { desc: `+6% ${s.theme} damage`, fx: { school, sdmg: 6 } },
     { desc: `+8% ${s.theme} duration`, fx: { school, sdur: 8 } },
-    { desc: `+4% ${s.theme} casting speed`, fx: { school, scd: 4 } },
+    { desc: `+4% ${s.theme} spell haste`, fx: { school, scd: 4 } },
   ];
   // schools whose spells have no meaningful duration trade it for damage
   const noDur = ['astral', 'gale', 'dusk'].includes(school);
@@ -238,7 +238,7 @@ SCHOOL_KEYS.forEach((school, k) => {
     const tpl = isNotable
       ? (i === 3
         ? { desc: `+15% ${s.theme} damage`, fx: { school, sdmg: 15 } }
-        : { desc: `+10% ${s.theme} area, +8% casting speed`, fx: { school, saoe: 10, scd: 8 } })
+        : { desc: `+10% ${s.theme} area, +8% spell haste`, fx: { school, saoe: 10, scd: 8 } })
       : schoolSmall(school, i);
     const id = add({
       id: `${school}-r${i}`,
@@ -387,5 +387,6 @@ export function computeBonuses(meta) {
 
 export function dustForRun(result, bonuses) {
   const base = result.kills * 0.35 + result.level * 3 + result.time / 6;
-  return Math.max(1, Math.round(base * (1 + (bonuses.dust || 0) / 100)));
+  // bonusDust (golden wisps, fallen stars) is flat, on top of the multiplier
+  return Math.max(1, Math.round(base * (1 + (bonuses.dust || 0) / 100)) + (result.bonusDust || 0));
 }

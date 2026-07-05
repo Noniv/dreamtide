@@ -173,6 +173,44 @@ body {
 .result-row .num { display: block; font-family: 'Cinzel', serif; font-weight: 700; font-size: 34px; color: var(--gold); text-shadow: 0 0 16px rgba(255, 210, 122, 0.5); }
 .result-row .lbl { font-size: 11px; letter-spacing: 0.3em; text-transform: uppercase; opacity: 0.6; }
 
+/* live stardust + evolved chips + banish */
+.dust-live {
+  font-family: 'Cinzel', serif; font-size: 13px; font-weight: 700;
+  color: var(--gold); text-shadow: 0 0 10px rgba(255, 210, 122, 0.5);
+  margin-top: 2px;
+}
+.spell-chip.evolved {
+  border-color: var(--gold);
+  box-shadow: 0 0 18px rgba(255, 210, 122, 0.55), inset 0 0 10px rgba(0,0,0,0.5);
+}
+.spell-chip.evolved .lv { color: var(--gold); border-color: var(--gold); }
+
+.card-slot { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+.card.evolve {
+  border-width: 2px;
+  border-color: var(--gold);
+  background:
+    radial-gradient(120% 90% at 50% 0%, color-mix(in srgb, var(--c) 22%, transparent), transparent 60%),
+    rgba(24, 16, 34, 0.94);
+  box-shadow: 0 0 34px rgba(255, 210, 122, 0.35);
+  animation: cardIn 0.4s ease-out backwards, evolvePulse 1.6s ease-in-out infinite;
+}
+@keyframes evolvePulse {
+  50% { box-shadow: 0 0 48px rgba(255, 210, 122, 0.55); }
+}
+.banish-btn {
+  font-family: 'Spectral', serif; font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase;
+  color: rgba(255, 122, 168, 0.85);
+  background: none;
+  border: 1px solid rgba(255, 122, 168, 0.35);
+  border-radius: 999px;
+  padding: 4px 14px; cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+.banish-btn:hover:not(:disabled) { background: rgba(255, 122, 168, 0.15); color: #ffb3cb; }
+.banish-btn:disabled { opacity: 0.25; cursor: default; }
+.banish-count { margin-top: 18px; font-size: 12px; font-style: italic; opacity: 0.6; }
+
 /* ---------------- constellation (skill tree) ---------------- */
 .menu-buttons { display: flex; gap: 14px; align-items: center; justify-content: center; flex-wrap: wrap; }
 .btn-secondary {

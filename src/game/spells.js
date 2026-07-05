@@ -247,9 +247,28 @@ export const SPELLS = {
   },
 };
 
+// evolutions: unlocked by raising a spell to max level, then choosing its
+// transcendent form on a later level-up
+export const EVOLVE = {
+  ember: { name: 'Pyre Bloom', desc: 'Embers scorch the ground where they burst.' },
+  arcane: { name: 'Arcane Torrent', desc: 'Missiles splinter into seeking shards on impact.' },
+  frost: { name: 'Absolute Winter', desc: 'The bloom freezes foes solid where they stand.' },
+  storm: { name: 'Skyfracture', desc: 'Thunder leaps three chains farther, barely fading.' },
+  void: { name: 'Event Horizon', desc: 'The rift drags even bosses, and collapses in a burst.' },
+  petals: { name: 'Wild Garden', desc: 'A second ring of petals waltzes against the first.' },
+  moon: { name: 'Eclipsing Lance', desc: 'Lances sweep across the field as they burn.' },
+  starfall: { name: 'Cosmic Ruin', desc: 'Fallen stars leave pools of burning starlight.' },
+  umbra: { name: 'Night’s Teeth', desc: 'Two more fangs, and their cut chills the living.' },
+  glaive: { name: 'Star Sovereign', desc: 'Glaives burst into stardust as they return to you.' },
+  nebula: { name: 'Genesis Cloud', desc: 'The nebula grows vast and follows its maker.' },
+  sigil: { name: 'The Great Seal', desc: 'The rune sounds twice.' },
+  lantern: { name: 'Lantern Procession', desc: 'Ghost-fire burns wider and fiercer.' },
+  nova: { name: 'Endless Dusk', desc: 'Each nova echoes a second wave.' },
+};
+
 export const BOONS = {
   power: { id: 'power', name: 'Lucid Focus', icon: '✦', desc: '+12% spell damage', max: 5 },
-  haste: { id: 'haste', name: 'Quickened Reverie', icon: '≋', desc: '+10% casting speed', max: 5 },
+  haste: { id: 'haste', name: 'Quickened Reverie', icon: '≋', desc: '+10% spell haste (diminishing)', max: 5 },
   vitality: { id: 'vitality', name: 'Heartbloom', icon: '❤', desc: '+25 max life, heal 25', max: 5 },
   swift: { id: 'swift', name: 'Zephyr Step', icon: '➳', desc: '+10% move speed', max: 4 },
   magnet: { id: 'magnet', name: 'Dream Lure', icon: '◉', desc: '+45% essence pickup radius', max: 4 },

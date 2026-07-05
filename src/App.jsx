@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { create } from 'zustand';
 import { Engine } from './game/engine.js';
-import { SPELLS, BOONS, GENERIC } from './game/spells.js';
+import { SPELLS, BOONS, GENERIC, EVOLVE } from './game/spells.js';
 import { audio } from './game/audio.js';
 import { TREE_NODES, TREE_EDGES, NODE_MAP, CLUSTER_INFO, loadMeta, saveMeta, canBuy, buyNode, isReachable, computeBonuses, dustForRun } from './game/meta.js';
 
@@ -10,6 +10,7 @@ const useGame = create((set) => ({
   hud: null,
   choices: [],
   newLevel: 1,
+  banishes: 0,
   result: null,
   dustEarned: 0,
   meta: loadMeta(),
@@ -26,12 +27,12 @@ function fmtTime(t) {
 export default function App() {
   const canvasRef = useRef(null);
   const engineRef = useRef(null);
-  const { screen, hud, choices, newLevel, result, dustEarned, meta, muted, set } = useGame();
+  const { screen, hud, choices, newLevel, banishes, result, dustEarned, meta, muted, set } = useGame();
 
   useEffect(() => {
     const engine = new Engine(canvasRef.current, {
       onHud: (h) => set({ hud: h }),
-      onLevelUp: (ch, lvl) => set({ screen: 'levelup', choices: ch, newLevel: lvl }),
+      onLevelUp: (ch, lvl, banishes) => set({ screen: 'levelup', choices: ch, newLevel: lvl, banishes }),
       onGameOver: (r) => {
         const st = useGame.getState();
         const bonuses = computeBonuses(st.meta);
@@ -79,7 +80,15 @@ export default function App() {
       {screen === 'playing' && hud && hud.paused && <div className="pause-overlay">PAUSED</div>}
 
       {screen === 'menu' && <Menu onStart={begin} meta={meta} onTree={() => set({ screen: 'tree' })} />}
-      {screen === 'levelup' && <LevelUp choices={choices} level={newLevel} onPick={pickChoice} />}
+      {screen === 'levelup' && (
+        <LevelUp
+          choices={choices}
+          level={newLevel}
+          banishes={banishes}
+          onPick={pickChoice}
+          onBanish={(c) => engineRef.current.banish(c)}
+        />
+      )}
       {screen === 'dead' && result && (
         <GameOver result={result} dustEarned={dustEarned} onRetry={begin} onTree={() => set({ screen: 'tree' })} />
       )}
@@ -111,14 +120,15 @@ function Hud({ hud, muted, onMute }) {
         <div className="hud-center">
           <div className="clock">{fmtTime(hud.time)}</div>
           <div className="kills">{hud.kills} banished</div>
+          <div className="dust-live">✦ {hud.dust}</div>
         </div>
         <button className="mute" onClick={onMute}>{muted ? '🔇' : '🔊'}</button>
       </div>
       <div className="hud-spells">
         {hud.spells.map((s) => (
-          <div key={s.id} className="spell-chip" style={{ '--c': SPELLS[s.id].color }}>
+          <div key={s.id} className={`spell-chip ${s.evolved ? 'evolved' : ''}`} style={{ '--c': SPELLS[s.id].color }}>
             <span className="glyph">{SPELLS[s.id].icon}</span>
-            <span className="lv">{s.level}</span>
+            <span className="lv">{s.evolved ? '★' : s.level}</span>
           </div>
         ))}
         {Object.entries(hud.boons).map(([id, lv]) => (
@@ -157,34 +167,45 @@ function Menu({ onStart, onTree, meta }) {
   );
 }
 
-function LevelUp({ choices, level, onPick }) {
+function LevelUp({ choices, level, banishes, onPick, onBanish }) {
   return (
     <div className="overlay levelup">
       <div className="eyebrow">Reverie deepens</div>
       <h2>Level {level}</h2>
       <div className="cards">
         {choices.map((c, i) => {
-          const def = c.kind === 'spell' ? SPELLS[c.id] : c.kind === 'boon' ? BOONS[c.id] : GENERIC[c.id];
-          const isSpell = c.kind === 'spell';
+          const isEvolve = c.kind === 'evolve';
+          const isSpell = c.kind === 'spell' || isEvolve;
+          const def = isSpell ? SPELLS[c.id] : c.kind === 'boon' ? BOONS[c.id] : GENERIC[c.id];
           return (
-            <button
-              key={i}
-              className={`card ${isSpell ? 'spell' : 'boon'}`}
-              style={isSpell ? { '--c': def.color, '--c2': def.color2 } : { '--c': '#ffd27a', '--c2': '#fff2cc' }}
-              onClick={() => onPick(c)}
-            >
-              <div className="card-glyph">{def.icon}</div>
-              <div className="card-name">{def.name}</div>
-              <div className="card-school">
-                {isSpell ? def.school : 'Boon'} · {c.kind === 'generic' ? `Rank ${c.level}` : (isSpell ? (c.isNew ? 'New spell' : `Level ${c.level}`) : `Rank ${c.level}`)}
-              </div>
-              <div className="card-desc">
-                {c.kind === 'generic' ? def.desc : (isSpell ? (c.isNew ? def.desc : def.levelText(c.level)) : def.desc)}
-              </div>
-            </button>
+            <div key={`${c.kind}-${c.id}-${i}`} className="card-slot">
+              <button
+                className={`card ${isEvolve ? 'evolve' : isSpell ? 'spell' : 'boon'}`}
+                style={isSpell ? { '--c': def.color, '--c2': def.color2 } : { '--c': '#ffd27a', '--c2': '#fff2cc' }}
+                onClick={() => onPick(c)}
+              >
+                <div className="card-glyph">{def.icon}</div>
+                <div className="card-name">{isEvolve ? EVOLVE[c.id].name : def.name}</div>
+                <div className="card-school">
+                  {isEvolve ? `${def.school} · Evolution` : isSpell ? `${def.school} · ${c.isNew ? 'New spell' : `Level ${c.level}`}` : `${c.kind === 'generic' ? 'Amplify' : 'Boon'} · Rank ${c.level}`}
+                </div>
+                <div className="card-desc">
+                  {isEvolve ? EVOLVE[c.id].desc : c.kind === 'generic' ? def.desc : (isSpell ? (c.isNew ? def.desc : def.levelText(c.level)) : def.desc)}
+                </div>
+              </button>
+              <button
+                className="banish-btn"
+                disabled={banishes <= 0}
+                title="Banish: never see this again this dream"
+                onClick={() => onBanish(c)}
+              >
+                ✕ banish
+              </button>
+            </div>
           );
         })}
       </div>
+      <div className="banish-count">{banishes} banish{banishes === 1 ? '' : 'es'} left this dream</div>
     </div>
   );
 }
