@@ -103,8 +103,20 @@ body {
   background: radial-gradient(ellipse at center, rgba(11, 10, 30, 0.55), rgba(5, 3, 18, 0.88));
   animation: fadeIn 0.45s ease-out;
   padding: 24px;
+  z-index: 5;
 }
 @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+
+/* screen transition: the previous overlay stays fully opaque *underneath*
+   while the next fades in on top, then dissolves only once the new screen
+   is fully in — the combined cover never dips, so there is no mid-fade
+   blink of the game behind them */
+.overlay.leaving {
+  animation: fadeOut 0.24s ease-in 0.45s forwards;
+  pointer-events: none;
+  z-index: 4;
+}
+@keyframes fadeOut { to { opacity: 0; } }
 
 .eyebrow {
   font-size: 12px; letter-spacing: 0.42em; text-transform: uppercase;
@@ -211,6 +223,64 @@ body {
 .banish-btn:disabled { opacity: 0.25; cursor: default; }
 .banish-count { margin-top: 18px; font-size: 12px; font-style: italic; opacity: 0.6; }
 
+/* reroll: the whole hand scatters into stardust before a fresh deal */
+.levelup-tools { margin-top: 18px; display: flex; flex-direction: column; align-items: center; gap: 10px; }
+.levelup-tools .banish-count { margin-top: 0; }
+.reroll-btn {
+  font-family: 'Cinzel', serif; font-size: 13px; font-weight: 700; letter-spacing: 0.16em;
+  color: var(--aurora);
+  background: rgba(13, 11, 34, 0.7);
+  border: 1px solid rgba(127, 245, 255, 0.4);
+  border-radius: 999px;
+  padding: 9px 26px; cursor: pointer;
+  box-shadow: 0 0 16px rgba(127, 245, 255, 0.18);
+  transition: transform 0.15s, box-shadow 0.15s, background 0.15s;
+}
+.reroll-btn:hover:not(:disabled) {
+  transform: translateY(-2px);
+  background: rgba(127, 245, 255, 0.12);
+  box-shadow: 0 0 28px rgba(127, 245, 255, 0.4);
+}
+.reroll-btn:disabled { opacity: 0.25; cursor: default; }
+.cards.rolling .card {
+  animation: rerollOut 0.42s ease-in forwards;
+  pointer-events: none;
+}
+.cards.rolling ~ * .banish-btn, .cards.rolling .banish-btn { opacity: 0; transition: opacity 0.2s; }
+@keyframes rerollOut {
+  0% { opacity: 1; filter: none; }
+  40% {
+    filter: blur(1px) brightness(1.5) saturate(1.5);
+    box-shadow: 0 0 50px rgba(127, 245, 255, 0.8), 0 0 100px rgba(180, 140, 255, 0.4);
+    transform: scale(1.03) rotate(-1deg);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(30px) scale(0.82) rotate(3deg);
+    filter: blur(12px) brightness(2);
+  }
+}
+
+/* banished card dissolves into violet dream-mist */
+.card-slot.banishing .card {
+  animation: banishOut 0.5s ease-in forwards;
+  pointer-events: none;
+}
+.card-slot.banishing .banish-btn { opacity: 0; transition: opacity 0.2s; }
+@keyframes banishOut {
+  0% { opacity: 1; filter: none; }
+  35% {
+    filter: blur(1px) saturate(1.8) brightness(1.4);
+    box-shadow: 0 0 60px rgba(180, 140, 255, 0.9), 0 0 120px rgba(255, 154, 213, 0.5);
+    transform: scale(1.04);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-46px) scale(1.12) rotate(2deg);
+    filter: blur(16px) saturate(2) brightness(1.8);
+  }
+}
+
 /* ---------------- constellation (skill tree) ---------------- */
 .menu-buttons { display: flex; gap: 14px; align-items: center; justify-content: center; flex-wrap: wrap; }
 .btn-secondary {
@@ -231,7 +301,57 @@ body {
 }
 .result-row .num.dust { color: var(--arcane); text-shadow: 0 0 16px rgba(180,140,255,0.6); }
 
-.tree-overlay { justify-content: flex-start; padding: 0; }
+/* nightmare shards — the Dark Bargain's currency, always crimson */
+.dust-live.shards, .dust-big.shards, .result-row .num.shards, .tip-cost.shards {
+  color: #ff7ab0;
+  text-shadow: 0 0 12px rgba(255, 90, 122, 0.55);
+}
+
+.tree-overlay {
+  justify-content: flex-start;
+  padding: 0;
+  overflow: hidden;
+  /* dedicated night-sky: deep indigo with faint aurora washes */
+  background:
+    radial-gradient(120% 90% at 20% -10%, rgba(84, 52, 158, 0.35), transparent 55%),
+    radial-gradient(110% 80% at 85% 110%, rgba(28, 92, 110, 0.3), transparent 55%),
+    radial-gradient(ellipse at center, #100c2c 0%, #070516 100%);
+}
+/* star-field + drifting nebulae behind the tree */
+.tree-bg { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+.tree-bg::before {
+  content: '';
+  position: absolute; inset: -60px;
+  background-image:
+    radial-gradient(1.4px 1.4px at 12% 24%, rgba(205, 216, 255, 0.9), transparent 100%),
+    radial-gradient(1px 1px at 32% 68%, rgba(127, 245, 255, 0.8), transparent 100%),
+    radial-gradient(1.8px 1.8px at 48% 12%, rgba(255, 255, 255, 0.95), transparent 100%),
+    radial-gradient(1.1px 1.1px at 63% 44%, rgba(255, 210, 122, 0.75), transparent 100%),
+    radial-gradient(1.5px 1.5px at 76% 79%, rgba(205, 216, 255, 0.85), transparent 100%),
+    radial-gradient(1px 1px at 87% 28%, rgba(255, 154, 213, 0.7), transparent 100%),
+    radial-gradient(1.3px 1.3px at 21% 87%, rgba(180, 140, 255, 0.8), transparent 100%),
+    radial-gradient(1px 1px at 55% 92%, rgba(127, 245, 255, 0.6), transparent 100%),
+    radial-gradient(1.6px 1.6px at 93% 62%, rgba(255, 255, 255, 0.8), transparent 100%),
+    radial-gradient(1px 1px at 7% 52%, rgba(255, 255, 255, 0.7), transparent 100%);
+  background-size: 520px 520px;
+  animation: treeTwinkle 7s ease-in-out infinite alternate;
+}
+.tree-bg::after {
+  content: '';
+  position: absolute; inset: -20%;
+  background:
+    radial-gradient(38% 30% at 28% 34%, rgba(138, 92, 255, 0.14), transparent 70%),
+    radial-gradient(32% 26% at 72% 62%, rgba(255, 154, 213, 0.1), transparent 70%),
+    radial-gradient(40% 34% at 55% 20%, rgba(127, 245, 255, 0.08), transparent 70%);
+  filter: blur(10px);
+  animation: nebulaDrift 26s ease-in-out infinite alternate;
+}
+@keyframes treeTwinkle { from { opacity: 0.55; } to { opacity: 1; } }
+@keyframes nebulaDrift {
+  from { transform: translate(-2%, -1%) scale(1); }
+  to { transform: translate(2%, 2%) scale(1.06); }
+}
+.tree-head, .tree-scroll { position: relative; z-index: 1; }
 .tree-head {
   width: 100%;
   display: flex; align-items: center; gap: 22px;
@@ -258,17 +378,30 @@ body {
 .cluster-name { font-size: 24px; font-weight: 700; letter-spacing: 0.12em; opacity: 0.85; }
 .cluster-count { font-size: 17px; fill: rgba(205, 216, 255, 0.55); }
 
-.tree-edge { stroke: rgba(205, 216, 255, 0.12); stroke-width: 2; }
-.tree-edge.half { stroke: rgba(180, 140, 255, 0.3); }
-.tree-edge.lit { stroke: rgba(180, 140, 255, 0.8); stroke-width: 2.5; filter: drop-shadow(0 0 4px rgba(180,140,255,0.8)); }
+.tree-edge { stroke: rgba(205, 216, 255, 0.3); stroke-width: 2; fill: none; }
+.tree-edge.half { stroke: rgba(180, 140, 255, 0.5); }
+.tree-edge.lit { stroke: rgba(180, 140, 255, 0.85); stroke-width: 2.5; filter: drop-shadow(0 0 4px rgba(180,140,255,0.8)); }
 
 .tree-node { cursor: default; }
 .tree-node.buyable { cursor: pointer; }
+.tree-node.refundable { cursor: pointer; }
+.tree-node.refundable:hover .body { stroke: var(--rose); filter: drop-shadow(0 0 10px rgba(255, 154, 213, 0.9)); }
 .tree-node .halo { fill: transparent; }
-.tree-node .body { fill: #171232; stroke: rgba(205,216,255,0.25); stroke-width: 1.5; transition: all 0.15s; }
+.tree-node .body { fill: #201a45; stroke: rgba(205,216,255,0.45); stroke-width: 1.5; transition: all 0.15s; }
 .tree-node .inner { fill: none; stroke: rgba(205,216,255,0.3); stroke-width: 1; }
-.tree-node.locked .body { opacity: 0.45; }
-.tree-node.reach .body { stroke: rgba(205,216,255,0.5); }
+.tree-node .node-icon {
+  fill: rgba(205, 216, 255, 0.8);
+  text-anchor: middle;
+  dominant-baseline: central;
+  font-family: 'Spectral', serif;
+  pointer-events: none;
+  user-select: none;
+}
+.tree-node.locked .body { opacity: 0.75; }
+.tree-node.locked .node-icon { fill: rgba(205, 216, 255, 0.45); }
+.tree-node.reach .body { stroke: rgba(205,216,255,0.7); }
+.tree-node.buyable .node-icon { fill: #ffe9bd; }
+.tree-node.owned .node-icon { fill: #ffffff; filter: drop-shadow(0 0 3px rgba(180,140,255,0.9)); }
 .tree-node.buyable .body { stroke: var(--gold); stroke-width: 2; filter: drop-shadow(0 0 6px rgba(255,210,122,0.7)); }
 .tree-node.buyable .halo { fill: rgba(255,210,122,0.07); }
 .tree-node.owned .body { fill: #3b2a78; stroke: var(--arcane); stroke-width: 2; filter: drop-shadow(0 0 8px rgba(180,140,255,0.9)); }
@@ -279,6 +412,22 @@ body {
 .tree-node:hover .halo { fill: rgba(127,245,255,0.12); stroke: rgba(127,245,255,0.5); stroke-width: 1.5; }
 .tree-node:hover .body { stroke-width: 3; }
 .tree-node.buyable:hover .body { filter: drop-shadow(0 0 12px rgba(255,210,122,1)); }
+
+/* the Dark Bargain: crimson-lit stars on near-black bodies, its own web */
+.tree-edge.dark { stroke: rgba(255, 90, 122, 0.22); }
+.tree-edge.dark.half { stroke: rgba(255, 90, 122, 0.45); }
+.tree-edge.dark.lit { stroke: rgba(255, 90, 122, 0.85); filter: drop-shadow(0 0 4px rgba(255, 90, 122, 0.8)); }
+.tree-node.dark .body { fill: #1c0812; stroke: rgba(255, 90, 122, 0.4); }
+.tree-node.dark .node-icon { fill: rgba(255, 150, 180, 0.75); }
+.tree-node.dark.locked .node-icon { fill: rgba(255, 150, 180, 0.4); }
+.tree-node.dark.reach .body { stroke: rgba(255, 122, 176, 0.7); }
+.tree-node.dark.buyable .body { stroke: #ff5a7a; filter: drop-shadow(0 0 6px rgba(255, 90, 122, 0.75)); }
+.tree-node.dark.buyable .halo { fill: rgba(255, 90, 122, 0.07); }
+.tree-node.dark.buyable .node-icon { fill: #ffb3cb; }
+.tree-node.dark.buyable:hover .body { filter: drop-shadow(0 0 12px rgba(255, 90, 122, 1)); }
+.tree-node.dark.owned .body { fill: #58122e; stroke: #ff7ab0; filter: drop-shadow(0 0 8px rgba(255, 90, 122, 0.9)); }
+.tree-node.dark.keystone .body { fill: #14060d; }
+.tree-node.dark.keystone.owned .body { fill: #701538; }
 
 .tree-scroll { position: relative; }
 .node-tip {
@@ -305,6 +454,8 @@ body {
 .tip-cost { font-family: 'Cinzel', serif; font-weight: 700; color: var(--gold); }
 .tip-locked { font-size: 12px; font-style: italic; opacity: 0.55; }
 .tip-owned { margin-top: 8px; color: #7dffb0; font-size: 13px; letter-spacing: 0.1em; }
+.tip-refund { color: var(--rose); font-style: italic; letter-spacing: 0; }
+.tip-owned .tip-locked { letter-spacing: 0; }
 .btn-buy {
   font-family: 'Cinzel', serif; font-weight: 700; font-size: 13px; letter-spacing: 0.16em;
   color: var(--ink);
@@ -318,6 +469,7 @@ body {
 
 @media (prefers-reduced-motion: reduce) {
   .overlay, .card { animation: none; }
+  .overlay.leaving { display: none; }
 }
 @media (max-width: 720px) {
   .cards { gap: 10px; }

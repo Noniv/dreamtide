@@ -74,6 +74,7 @@ export class Engine {
     this.paused = false;
     this._levelUpActive = false;
     this.reset();
+    this.wake = 0; // no dream-in behind the main menu; begin() re-arms it
     this.bindInput();
     this.resize();
     window.addEventListener('resize', () => this.resize());
@@ -81,12 +82,21 @@ export class Engine {
 
   reset() {
     this.meta = (this.hooks.getMeta && this.hooks.getMeta()) || {};
+    this.particles = new ParticleSystem(); // drop every leftover mote of the last dream
     this.t = 0;
+    this.wake = 1.8; // dream-in: the world condenses out of pale light
     this._cheated = false;
     this.banished = new Set();
-    this.banishCharges = 2;
+    this.banishCharges = this.meta.banish || 0;
+    this.rerollCharges = this.meta.reroll || 0;
+    this.surgeT = 8;
+    this.surges = {};
+    this._mergeT = 0;
+    const fm = this.meta.spellMods && this.meta.spellMods.frost;
+    this._chillAmp = (fm && fm.special && fm.special.chillAmp) || 0;
     this.breather = 0;
     this.bonusDust = 0;
+    this.shardsEarned = 0;
     this.banner = null; // { str, color, life, maxLife }
     this.pickups = [];
     this.starTimer = 75;
@@ -95,11 +105,12 @@ export class Engine {
     this._waveEventDone = true;
     this._goldenAt = 0;
     this.kills = 0;
+    this._pendingLevels = 0; // level-ups earned but not yet chosen (queued)
     this.shake = 0;
     this.hudTimer = 0;
     this.spawnTimer = 1.2;
-    this.eliteTimer = 35;
-    this.bossTimer = 95;
+    this.eliteTimer = 35 / (1 + (this.meta.baneElite || 0) / 100);
+    this.bossTimer = 95 / (1 + (this.meta.baneBoss || 0) / 100);
     this.bossCount = 0;
     this.flash = null; // {color, a}
     this.enemies = [];
@@ -137,11 +148,26 @@ export class Engine {
     if (m.hp) { this.player.maxHp += m.hp; this.player.hp = this.player.maxHp; }
     if (m.speed) this.player.speed *= 1 + m.speed / 100;
     if (m.magnet) this.player.metaMagnet = 1 + m.magnet / 100;
-    if (m.twinSpark) {
-      const ids = Object.keys(SPELLS).filter((id) => id !== 'arcane');
-      this.player.spells.push({ id: pick(ids), level: 1, cd: 0.6 });
+    if (m.startSpells) {
+      for (const id of m.startSpells) {
+        if (this.player.spells.length >= 6) break;
+        if (!this.player.spells.find((s) => s.id === id)) this.player.spells.push({ id, level: 1, cd: 0.5 });
+      }
     }
+    // Waking Start: every spell you begin with starts a level stronger
+    if (m.startLv) for (const s of this.player.spells) s.level = Math.min(this.statCap(), s.level + m.startLv);
     this.rebuildOrbitals();
+    // stardust condenses inward around the sleeper as the dream forms
+    for (let i = 0; i < 90; i++) {
+      const a = rand(0, TAU), R = rand(160, 560);
+      this.particles.spawn({
+        x: Math.cos(a) * R, y: Math.sin(a) * R - 20,
+        vx: -Math.cos(a) * R * rand(0.6, 1.0), vy: -Math.sin(a) * R * rand(0.6, 1.0),
+        life: rand(0.7, 1.6), size: rand(1.5, 4.5),
+        color: pick(['#b48cff', '#7ff5ff', '#ff9ad5', '#ffd27a']),
+        mode: Math.random() < 0.5 ? 'star' : 'glow', rotV: rand(-4, 4), drag: 0.9,
+      });
+    }
   }
 
   resize() {
@@ -185,21 +211,36 @@ export class Engine {
   stop() { this.running = false; }
 
   // -------------------------------------------------------------- boon math
-  dmgMul() { return (1 + 0.12 * (this.player.boons.power || 0)) * (1 + 0.1 * (this.player._genericPower || 0)) * (1 + (this.meta.dmg || 0) / 100); }
+  dmgMul() { return (1 + 0.12 * (this.player.boons.power || 0)) * (1 + 0.1 * (this.player._genericPower || 0)) * (1 + (this.meta.dmg || 0) / 100) * (this.surges.dmg > 0 ? 1.3 : 1); }
   // "spell haste": all sources add into one pool with natural diminishing
   // returns — 100 haste halves cooldowns, the next 100 only cuts a third more
   cdMul() {
-    const haste = (this.player.boons.haste || 0) * 10 + (this.meta.cast || 0);
+    const haste = (this.player.boons.haste || 0) * 10 + (this.meta.cast || 0) + (this.surges.haste > 0 ? 30 : 0);
     return 1 / (1 + haste / 100);
   }
-  magnetR() { return 90 * (1 + 0.45 * (this.player.boons.magnet || 0)) * (this.player.metaMagnet || 1); }
-  aoeMul() { return (1 + 0.1 * (this.player._genericAoe || 0)) * (1 + (this.meta.aoe || 0) / 100); }
-  spellMaxLevel(id) { return SPELLS[id].maxLevel + (this.meta.maxLv || 0); }
+  magnetR() { return 90 * (1 + 0.45 * (this.player.boons.magnet || 0)) * (this.player.metaMagnet || 1) * (this.surges.magnet > 0 ? 1.6 : 1); }
+  aoeMul() { return (1 + 0.1 * (this.player._genericAoe || 0)) * (1 + (this.meta.aoe || 0) / 100) * (this.surges.aoe > 0 ? 1.3 : 1); }
+  // real stat upgrades stop at 5; the evolution (if unlocked) is the sixth
+  // step and grants the level-6 stats; beyond that only mastery (damage) grows
+  statCap() { return 5; }
+  evoUnlocked(id) { const m = this.meta.spellMods && this.meta.spellMods[id]; return !!(m && m.evo); }
 
-  // level stats with school-cluster (constellation) modifiers folded in
-  spellStats(id, lv) {
-    const st = { ...SPELLS[id].stats(lv) };
+  // level stats with constellation (per-spell cluster) modifiers folded in.
+  // Mastery ranks are pure damage growth, no new mechanics.
+  spellStats(id, lv, mastery = 0) {
+    const st = { ...SPELLS[id].stats(Math.min(lv, SPELLS[id].maxLevel)) };
+    if (mastery > 0) {
+      const per = 0.08 + (this.meta.masteryPlus || 0) / 100;
+      // diminishing returns: the bonus grows with the square root of ranks,
+      // so the first rank is still worth `per` (~8%) but deep stacks flatten
+      // out — no build can grow damage fast enough to outrun the endless,
+      // linear HP ramp forever. Rank 1 = +8%, rank 4 = +16%, rank 16 = +32%…
+      const bonus = per * Math.sqrt(mastery);
+      if (st.damage != null) st.damage *= 1 + bonus;
+      if (st.dps != null) st.dps *= 1 + bonus;
+    }
     const m = this.meta.spellMods && this.meta.spellMods[id];
+    st.special = (m && m.special) || {};
     if (!m) return st;
     if (st.damage != null) st.damage *= 1 + m.dmg / 100;
     if (st.dps != null) st.dps *= 1 + m.dmg / 100;
@@ -215,6 +256,18 @@ export class Engine {
       else if (st.chains != null) st.chains += m.count;
       else if (st.beams != null) st.beams += m.count;
     }
+    // spell-specific medium nodes
+    const S = st.special;
+    if (S.seek && st.speed != null) st.speed *= 1 + S.seek / 100;
+    if (S.speed && st.speed != null) st.speed *= 1 + S.speed / 100;
+    if (S.range && st.range != null) st.range *= 1 + S.range / 100;
+    if (S.pull && st.pull != null) st.pull *= 1 + S.pull / 100;
+    if (S.knock && st.knock != null) st.knock *= 1 + S.knock / 100;
+    if (S.slow && st.slow != null) st.slow = Math.min(0.95, st.slow * (1 + S.slow / 100));
+    if (S.sleep && st.sleepDur != null) st.sleepDur += S.sleep;
+    if (S.vigil && st.duration != null) st.duration += S.vigil;
+    if (S.wide && st.width != null) st.width *= 1 + S.wide / 100;
+    if (S.reach && st.length != null) st.length *= 1 + S.reach / 100;
     return st;
   }
 
@@ -248,15 +301,26 @@ export class Engine {
   gainXp(n) {
     const p = this.player;
     p.xp += n * (1 + (this.meta.xp || 0) / 100);
+    // a single gem can cross several thresholds at once (merged dreamshards,
+    // gem showers). Queue one choice per level and hand them out one at a
+    // time — otherwise every level but the last would be silently skipped.
     while (p.xp >= p.xpNext) {
       p.xp -= p.xpNext;
       p.level++;
       p.xpNext = Math.floor(6 + Math.pow(p.level, 1.55) * 3.4);
-      this.offerChoices();
+      this._pendingLevels++;
     }
+    this.maybeOpenLevelUp();
   }
 
-  buildChoices() {
+  // open the next queued level-up, unless one is already on screen
+  maybeOpenLevelUp() {
+    if (this._levelUpActive || this._pendingLevels <= 0) return;
+    this._pendingLevels--;
+    this.offerChoices();
+  }
+
+  buildChoicePool() {
     const p = this.player;
     const isStatLevel = p.level % 5 === 0;
     const banned = (kind, id) => this.banished.has(`${kind}:${id}`);
@@ -267,14 +331,22 @@ export class Engine {
       pool.push({ kind: 'generic', id: 'vital', level: (p._genericVital || 0) + 1 });
     };
 
-    // evolutions: any maxed, un-evolved spell may transcend
+    // evolutions: only spells whose transcendence is awakened in the
+    // Constellation may evolve — it is the step beyond level 5
     const evolvePool = [];
     for (const id of Object.keys(SPELLS)) {
       const owned = p.spells.find((s) => s.id === id);
-      if (owned && !owned.evolved && owned.level >= this.spellMaxLevel(id) && !banned('spell', id)) {
+      if (owned && !owned.evolved && owned.level >= this.statCap() && this.evoUnlocked(id) && !banned('spell', id)) {
         evolvePool.push({ kind: 'evolve', id });
       }
     }
+
+    // cluster entry nodes weight a spell to appear more often
+    const pushWeighted = (c) => {
+      const m = this.meta.spellMods && this.meta.spellMods[c.id];
+      const extra = (m && m.weight) || 0;
+      for (let i = 0; i <= extra; i++) pool.push(c);
+    };
 
     if (isStatLevel) {
       for (const id of Object.keys(BOONS)) {
@@ -285,21 +357,36 @@ export class Engine {
       for (const id of Object.keys(SPELLS)) {
         if (banned('spell', id)) continue;
         const owned = p.spells.find((s) => s.id === id);
-        if (!owned && p.spells.length < 6) pool.push({ kind: 'spell', id, isNew: true });
-        else if (owned && owned.level < this.spellMaxLevel(id)) pool.push({ kind: 'spell', id, isNew: false, level: owned.level + 1 });
+        if (!owned && p.spells.length < 6) pushWeighted({ kind: 'spell', id, isNew: true });
+        else if (owned && owned.level < this.statCap()) pushWeighted({ kind: 'spell', id, isNew: false, level: owned.level + 1 });
+        // mastery: past the cap the dream deepens — pure damage, no dead ends
+        else if (owned && (owned.evolved || !this.evoUnlocked(id))) pushWeighted({ kind: 'spell', id, isNew: false, mastery: true, level: (owned.mastery || 0) + 1 });
       }
       if (pool.length === 0 && evolvePool.length === 0) genericPool();
     }
+    return { pool, evolvePool, isStatLevel };
+  }
 
+  buildChoices() {
+    const { pool, evolvePool, isStatLevel } = this.buildChoicePool();
     const choices = [];
-    const nChoices = this.meta.fourfold ? 4 : 3;
+    const nChoices = 3 + (this.meta.fourfold || 0);
+    const keyOf = (c) => `${c.kind === 'evolve' ? 'spell' : c.kind}:${c.id}`;
+    const taken = new Set();
     // an available evolution always claims one slot — it's the run's big moment
-    if (evolvePool.length && !isStatLevel) choices.push(evolvePool[(Math.random() * evolvePool.length) | 0]);
+    if (evolvePool.length && !isStatLevel) {
+      const ev = evolvePool[(Math.random() * evolvePool.length) | 0];
+      choices.push(ev);
+      taken.add(keyOf(ev));
+    }
     while (choices.length < nChoices && pool.length) {
       const i = (Math.random() * pool.length) | 0;
-      choices.push(pool.splice(i, 1)[0]);
+      const c = pool.splice(i, 1)[0];
+      if (taken.has(keyOf(c))) continue; // weighted duplicates
+      taken.add(keyOf(c));
+      choices.push(c);
     }
-    if (choices.length === 0) { genericPool(); choices.push(pool[0]); }
+    if (choices.length === 0) choices.push({ kind: 'generic', id: 'power', level: (this.player._genericPower || 0) + 1 });
     return choices;
   }
 
@@ -307,25 +394,51 @@ export class Engine {
     this._levelUpActive = true;
     this.paused = true;
     audio.levelUp();
-    this.hooks.onLevelUp(this.buildChoices(), this.player.level, this.banishCharges);
+    this._choices = this.buildChoices();
+    this.hooks.onLevelUp(this._choices, this.player.level, this.banishCharges, this.rerollCharges);
   }
 
+  // reroll sweeps the whole hand away and deals a fresh one
+  reroll() {
+    if (this.rerollCharges <= 0) return;
+    this.rerollCharges--;
+    audio.nebulaCast();
+    this._choices = this.buildChoices();
+    this.hooks.onLevelUp([...this._choices], this.player.level, this.banishCharges, this.rerollCharges);
+  }
+
+  // banishing removes only the chosen card, seals it away for the rest of the
+  // run, and deals a fresh replacement into its slot
   banish(choice) {
     if (this.banishCharges <= 0) return;
     this.banishCharges--;
-    const kind = choice.kind === 'evolve' ? 'spell' : choice.kind;
-    this.banished.add(`${kind}:${choice.id}`);
-    this.hooks.onLevelUp(this.buildChoices(), this.player.level, this.banishCharges);
+    const keyOf = (c) => `${c.kind === 'evolve' ? 'spell' : c.kind}:${c.id}`;
+    this.banished.add(keyOf(choice));
+    audio.voidCast();
+    const idx = this._choices.indexOf(choice);
+    const shown = new Set(this._choices.map(keyOf));
+    const { pool, evolvePool } = this.buildChoicePool();
+    const fresh = [...pool, ...evolvePool].filter((c) => !shown.has(keyOf(c)));
+    const repl = fresh.length ? fresh[(Math.random() * fresh.length) | 0] : null;
+    if (idx >= 0) {
+      if (repl) this._choices.splice(idx, 1, repl);
+      else this._choices.splice(idx, 1);
+    }
+    this.hooks.onLevelUp([...this._choices], this.player.level, this.banishCharges, this.rerollCharges);
   }
 
   chooseUpgrade(choice) {
-    if (choice.kind === 'spell') this.addSpell(choice.id);
+    if (choice.kind === 'spell' && choice.mastery) {
+      const s = this.player.spells.find((x) => x.id === choice.id);
+      if (s) s.mastery = (s.mastery || 0) + 1;
+    } else if (choice.kind === 'spell') this.addSpell(choice.id);
     else if (choice.kind === 'boon') this.applyBoon(choice.id);
     else if (choice.kind === 'generic') this.applyGeneric(choice.id);
     else if (choice.kind === 'evolve') {
       const s = this.player.spells.find((x) => x.id === choice.id);
       if (s) {
         s.evolved = true;
+        s.level = Math.max(s.level, SPELLS[choice.id].maxLevel); // evolving is the sixth step
         if (choice.id === 'petals') this.rebuildOrbitals();
         this.setBanner(`${SPELLS[choice.id].name.toUpperCase()} → ${EVOLVE[choice.id].name.toUpperCase()}`, SPELLS[choice.id].color);
         this.flash = { color: '255,210,122', a: 0.3 };
@@ -341,6 +454,11 @@ export class Engine {
       this.particles.spawn({ x: p.x, y: p.y, vx: Math.cos(a) * rand(120, 300), vy: Math.sin(a) * rand(120, 300), life: rand(0.5, 1.1), size: rand(2, 5), color: '#ffd27a', color2: '#b48cff', mode: 'star', rotV: rand(-4, 4), drag: 0.92 });
     }
     this.pushHud(true);
+    // more levels banked this frame? deal the next hand right away.
+    // returns true when another level-up is now on screen so the caller
+    // doesn't drop back to the playing view.
+    this.maybeOpenLevelUp();
+    return this._levelUpActive;
   }
 
   applyGeneric(id) {
@@ -352,11 +470,13 @@ export class Engine {
 
   // -------------------------------------------------------------- spawning
   currentWave() {
+    // Cruel Dawn (dark bargain): the difficulty clock runs ahead of the run clock
+    const T = this.t + (this.meta.baneAhead || 0);
     let idx = 0;
-    for (let i = 0; i < WAVES.length; i++) { if (this.t >= WAVES[i].t) idx = i; else break; }
+    for (let i = 0; i < WAVES.length; i++) { if (T >= WAVES[i].t) idx = i; else break; }
     const w = WAVES[idx];
     if (idx === WAVES.length - 1) {
-      const extra = Math.floor((this.t - w.t) / 60);
+      const extra = Math.floor((T - w.t) / 60);
       if (extra > 0) {
         return {
           ...w, idx: idx + extra,
@@ -371,11 +491,17 @@ export class Engine {
 
   difficulty() {
     const w = this.currentWave();
-    return { hpMul: w.hp, spdMul: 1 + Math.min(0.5, this.t * 0.0008), rate: w.rate, dmgMul: w.dmg };
+    const m = this.meta;
+    return {
+      hpMul: w.hp * (1 + (m.baneHp || 0) / 100),
+      spdMul: (1 + Math.min(0.5, this.t * 0.0008)) * (1 + (m.baneSpeed || 0) / 100),
+      rate: w.rate / (1 + (m.baneRate || 0) / 100),
+      dmgMul: w.dmg * (1 + (m.baneDmg || 0) / 100),
+    };
   }
 
-  setBanner(str, color = '#cdd8ff') {
-    this.banner = { str, color, life: 3, maxLife: 3 };
+  setBanner(str, color = '#cdd8ff', life = 3, size = 24) {
+    this.banner = { str, color, life, maxLife: life, size };
   }
 
   spawnEnemy(typeId, elite = false, boss = false) {
@@ -383,7 +509,7 @@ export class Engine {
     const d = this.difficulty();
     const ang = Math.random() * TAU;
     const R = Math.max(this.cam.w, this.cam.h) * 0.62 + 60;
-    const mul = boss ? 1 : elite ? 2.5 : 1;
+    const mul = boss ? 1 : elite ? 7 : 1;
     const e = {
       type: typeId, boss,
       x: this.player.x + Math.cos(ang) * R,
@@ -403,6 +529,7 @@ export class Engine {
     if (boss) {
       audio.bossRoar();
       this.flash = { color: '154,92,255', a: 0.35 };
+      this.setBanner('☽  THE DEVOURER STIRS  ☾', '#c48cff', 4.2, 38);
       this.texts.push({ x: e.x, y: e.y - 60, str: 'THE DEVOURER STIRS', color: '#c48cff', life: 2.4, vy: -12, size: 22 });
     }
     return e;
@@ -415,7 +542,7 @@ export class Engine {
       this._waveIdx = w.idx;
       this._waveEventAt = this.t + rand(12, 30);
       this._waveEventDone = !w.event;
-      this._goldenAt = Math.random() < 0.35 ? this.t + rand(15, 40) : 0;
+      this._goldenAt = Math.random() < (this.meta.golden ? 0.7 : 0.35) ? this.t + rand(15, 40) : 0;
     }
     const pickType = () => {
       const entries = Object.entries(w.types);
@@ -431,13 +558,15 @@ export class Engine {
     } else {
       this.spawnTimer -= dt;
       const alive = this.enemies.length;
-      if (alive < w.floor && this.spawnTimer <= 0) {
+      const floor = w.floor + (this.meta.baneFloor || 0);
+      const rate = w.rate / (1 + (this.meta.baneRate || 0) / 100);
+      if (alive < floor && this.spawnTimer <= 0) {
         // refill quickly up to the wave's floor
         this.spawnTimer = 0.2;
-        const n = Math.min(6, w.floor - alive);
+        const n = Math.min(6, floor - alive);
         for (let i = 0; i < n; i++) this.spawnEnemy(pickType());
       } else if (this.spawnTimer <= 0 && alive < 230) {
-        this.spawnTimer = w.rate * rand(0.7, 1.3);
+        this.spawnTimer = rate * rand(0.7, 1.3);
         const burst = 1 + ((Math.random() * 3) | 0);
         for (let i = 0; i < burst; i++) this.spawnEnemy(pickType());
       }
@@ -454,12 +583,12 @@ export class Engine {
 
     this.eliteTimer -= dt;
     if (this.eliteTimer <= 0) {
-      this.eliteTimer = Math.max(32, 50 - this.t / 40);
+      this.eliteTimer = Math.max(32, 50 - this.t / 40) / (1 + (this.meta.baneElite || 0) / 100);
       this.spawnEnemy(pickType(), true);
     }
     this.bossTimer -= dt;
     if (this.bossTimer <= 0) {
-      this.bossTimer = 115;
+      this.bossTimer = 115 / (1 + (this.meta.baneBoss || 0) / 100);
       this.bossCount++;
       this.spawnEnemy('eye', false, true);
     }
@@ -516,11 +645,26 @@ export class Engine {
   }
 
   // -------------------------------------------------------------- spells
+  // the camera rect, expanded (or shrunk, with negative margin) — every
+  // targeting decision goes through this so nothing is aimed off-screen
+  viewRect(margin = 0) {
+    const { x, y, w, h } = this.cam;
+    return { left: x - margin, right: x + w + margin, top: y - margin, bottom: y + h + margin };
+  }
+
+  inView(x, y, margin = 0) {
+    const r = this.viewRect(margin);
+    return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+  }
+
+  // pull a point back inside the visible screen (with a small inset)
+  clampToView(x, y, inset = 40) {
+    const r = this.viewRect(-inset);
+    return { x: clamp(x, r.left, r.right), y: clamp(y, r.top, r.bottom) };
+  }
+
   visibleEnemies() {
-    const { x: cx, y: cy, w, h } = this.cam;
-    const margin = 80;
-    const left = cx - margin, right = cx + w + margin;
-    const top = cy - margin, bottom = cy + h + margin;
+    const { left, right, top, bottom } = this.viewRect(0);
     return this.enemies.filter((e) => !e.dead && e.x >= left && e.x <= right && e.y >= top && e.y <= bottom);
   }
 
@@ -529,10 +673,7 @@ export class Engine {
     let boss = null, bossD = Infinity;
     const halfScreen = Math.max(this.cam.w, this.cam.h) * 0.5;
     const bossRange = halfScreen * halfScreen;
-    const { x: cx, y: cy, w, h } = this.cam;
-    const margin = 80;
-    const left = cx - margin, right = cx + w + margin;
-    const top = cy - margin, bottom = cy + h + margin;
+    const { left, right, top, bottom } = this.viewRect(0);
     for (const e of this.enemies) {
       if (e === exclude || e.dead) continue;
       if (e.x < left || e.x > right || e.y < top || e.y > bottom) continue;
@@ -551,7 +692,7 @@ export class Engine {
   pickTarget(x, y, maxR = Infinity) {
     const nearest = this.nearestEnemy(x, y, maxR);
     if (nearest && !nearest.boss) {
-      const boss = this.enemies.find((e) => e.boss && !e.dead && dist2(x, y, e.x, e.y) < maxR * maxR);
+      const boss = this.enemies.find((e) => e.boss && !e.dead && this.inView(e.x, e.y) && dist2(x, y, e.x, e.y) < maxR * maxR);
       if (boss && Math.random() < 0.35) return boss;
     }
     return nearest;
@@ -584,7 +725,7 @@ export class Engine {
     const p = this.player;
     const visible = this.visibleEnemies().length > 0;
     for (const s of p.spells) {
-      const st = this.spellStats(s.id, s.level);
+      const st = this.spellStats(s.id, s.level, s.mastery || 0);
       st.evolved = !!s.evolved;
       if (s.id === 'petals') continue; // continuous
       s.cd -= dt;
@@ -610,7 +751,8 @@ export class Engine {
             kind: 'arcane', x: p.x, y: p.y - 26,
             vx: Math.cos(a) * st.speed * 0.5, vy: Math.sin(a) * st.speed * 0.5,
             speed: st.speed, dmg: st.damage * this.dmgMul(), life: 2.6, r: 7,
-            turn: 7.5, target, splinter: st.evolved,
+            turn: st.special.seek ? 10.5 : 7.5, target, splinter: st.evolved,
+            pierce: st.special.pierce || 0, struck: null,
           });
         }
         audio.arcaneCast(rand(-0.4, 0.4));
@@ -621,15 +763,18 @@ export class Engine {
         const cluster = this.densestPoint(blastR);
         for (let i = 0; i < st.count + (this.meta.extraCount || 0); i++) {
           // first ember on the thickest knot, the rest carpet around it
-          const spread = i === 0 ? 20 : blastR * 0.9;
-          const tx = cluster ? cluster.x + rand(-spread, spread) : p.x + rand(-260, 260);
-          const ty = cluster ? cluster.y + rand(-spread, spread) : p.y + rand(-260, 260);
+          const spread = i === 0 ? 20 : blastR * (st.special.carpet ? 0.5 : 0.9);
+          const { x: tx, y: ty } = this.clampToView(
+            cluster ? cluster.x + rand(-spread, spread) : p.x + rand(-260, 260),
+            cluster ? cluster.y + rand(-spread, spread) : p.y + rand(-260, 260),
+          );
           const flight = rand(0.55, 0.8);
+          const burnPct = (st.evolved ? 40 : 0) + (st.special.burn || 0);
           this.projectiles.push({
             kind: 'ember', x: p.x, y: p.y - 30, sx: p.x, sy: p.y - 30, tx, ty,
             t: 0, dur: flight, arc: rand(70, 150),
             dmg: st.damage * this.dmgMul(), radius: st.radius * this.aoeMul(), r: 9,
-            burn: st.evolved ? { c1: '#ff8c5a', c2: '#ffd27a', dps: st.damage * this.dmgMul() * 0.4 } : null,
+            burn: burnPct ? { c1: '#ff8c5a', c2: '#ffd27a', dps: st.damage * this.dmgMul() * burnPct / 100 } : null,
           });
         }
         audio.fireCast();
@@ -638,7 +783,7 @@ export class Engine {
       case 'frost': {
         audio.frostCast();
         const R = st.radius * this.aoeMul();
-        this.zones.push({ kind: 'frostwave', x: p.x, y: p.y, r: 10, maxR: R, life: 0.45, maxLife: 0.45, dmg: st.damage * this.dmgMul(), slow: st.evolved ? 1 : st.slow, slowDur: st.slowDur + (st.evolved ? 0.8 : 0), hit: new Set() });
+        this.zones.push({ kind: 'frostwave', x: p.x, y: p.y, r: 10, maxR: R, life: 0.45, maxLife: 0.45, dmg: st.damage * this.dmgMul(), slow: st.evolved ? 1 : st.slow, slowDur: st.slowDur + (st.evolved ? 0.8 : 0), hit: new Set(), bossChill: !!st.special.bossChill });
         for (let i = 0; i < 70; i++) {
           const a = rand(0, TAU);
           this.particles.spawn({ x: p.x + Math.cos(a) * 14, y: p.y + Math.sin(a) * 14, vx: Math.cos(a) * rand(180, R * 2.4), vy: Math.sin(a) * rand(180, R * 2.4), life: rand(0.35, 0.7), size: rand(3, 8), endSize: 1, color: '#e8fbff', color2: '#8fe8ff', mode: Math.random() < 0.5 ? 'shard' : 'glow', rotV: rand(-8, 8), drag: 0.88 });
@@ -653,7 +798,7 @@ export class Engine {
         let cur = first;
         const hitSet = new Set();
         const chains = st.chains + (st.evolved ? 3 : 0);
-        const falloff = st.evolved ? 0.92 : 0.85;
+        const falloff = Math.min(0.96, (st.evolved ? 0.92 : 0.85) + (st.special.falloff ? 0.06 : 0));
         for (let c = 0; c <= chains && cur; c++) {
           this.spawnBolt(from.x, from.y, cur.x, cur.y);
           this.damageEnemy(cur, st.damage * this.dmgMul() * Math.pow(falloff, c), '#bfeaff');
@@ -662,10 +807,7 @@ export class Engine {
           from = cur;
           cur = null;
           let bd = 240 * 240;
-          const { x: cx, y: cy, w, h } = this.cam;
-          const margin = 80;
-          const left = cx - margin, right = cx + w + margin;
-          const top = cy - margin, bottom = cy + h + margin;
+          const { left, right, top, bottom } = this.viewRect(0);
           for (const e of this.enemies) {
             if (hitSet.has(e) || e.dead) continue;
             if (e.x < left || e.x > right || e.y < top || e.y > bottom) continue;
@@ -680,10 +822,9 @@ export class Engine {
         // open at the densest cluster of visible enemies (pull reaches beyond r)
         const riftR = st.radius * this.aoeMul();
         const pt = this.densestPoint(riftR * 1.4);
-        const bx = pt ? pt.x : p.x + rand(-220, 220);
-        const by = pt ? pt.y : p.y + rand(-220, 220);
+        const { x: bx, y: by } = this.clampToView(pt ? pt.x : p.x + rand(-220, 220), pt ? pt.y : p.y + rand(-220, 220));
         audio.voidCast();
-        this.zones.push({ kind: 'rift', x: bx, y: by, r: riftR, life: st.duration, maxLife: st.duration, dps: st.dps * this.dmgMul(), pull: st.pull, tick: 0, spin: rand(0, TAU), evolved: st.evolved });
+        this.zones.push({ kind: 'rift', x: bx, y: by, r: riftR, life: st.duration, maxLife: st.duration, dps: st.dps * this.dmgMul(), pull: st.pull, tick: 0, spin: rand(0, TAU), evolved: st.evolved, bossPull: !!st.special.bossPull });
         break;
       }
       case 'moon': {
@@ -705,13 +846,16 @@ export class Engine {
         const cluster = this.densestPoint(blastR);
         for (let i = 0; i < count; i++) {
           const spread = i === 0 ? 16 : blastR * 0.9;
-          const tx = cluster ? cluster.x + rand(-spread, spread) : p.x + rand(-300, 300);
-          const ty = cluster ? cluster.y + rand(-spread, spread) : p.y + rand(-300, 300);
+          const { x: tx, y: ty } = this.clampToView(
+            cluster ? cluster.x + rand(-spread, spread) : p.x + rand(-300, 300),
+            cluster ? cluster.y + rand(-spread, spread) : p.y + rand(-300, 300),
+          );
           this.projectiles.push({
             kind: 'comet', tx, ty,
             x: tx + rand(-140, -60), y: ty - 560,
             t: 0, dur: rand(0.5, 0.7),
             dmg: st.damage * this.dmgMul(), radius: st.radius * this.aoeMul(),
+            stun: !!st.special.stun,
             burn: st.evolved ? { c1: '#ffb3f2', c2: '#8a7bff', dps: st.damage * this.dmgMul() * 0.35 } : null,
           });
         }
@@ -727,7 +871,8 @@ export class Engine {
           this.projectiles.push({
             kind: 'fang', x: p.x, y: p.y - 18,
             vx: Math.cos(a) * st.speed, vy: Math.sin(a) * st.speed,
-            dmg: st.damage * this.dmgMul(), life: 1.5, r: 12, hit: new Set(), chill: st.evolved,
+            dmg: st.damage * this.dmgMul() * (st.evolved ? 1.5 : 1), life: 1.5, r: 12 * (st.special.big ? 1.4 : 1),
+            hit: new Set(), chill: !!st.special.chill,
           });
         }
         break;
@@ -742,7 +887,8 @@ export class Engine {
           this.projectiles.push({
             kind: 'glaive', x: p.x, y: p.y - 20, a,
             travelled: 0, range: st.range, speed: st.speed, returning: false,
-            dmg: st.damage * this.dmgMul(), life: 6, r: 14, spin: 0, hitCd: {}, evolved: st.evolved,
+            dmg: st.damage * this.dmgMul(), life: 6, r: 14, spin: 0, hitCd: {},
+            hitInt: st.special.fastHit ? 0.28 : 0.45, evolved: st.evolved,
           });
         }
         break;
@@ -751,14 +897,14 @@ export class Engine {
         audio.nebulaCast();
         const cloudR = st.radius * this.aoeMul() * (st.evolved ? 1.25 : 1);
         const pt = this.densestPoint(cloudR);
-        const bx = pt ? pt.x : p.x + rand(-220, 220);
-        const by = pt ? pt.y : p.y + rand(-220, 220);
+        const { x: bx, y: by } = this.clampToView(pt ? pt.x : p.x + rand(-220, 220), pt ? pt.y : p.y + rand(-220, 220));
         const driftA = rand(0, TAU);
         this.zones.push({
           kind: 'nebula', x: bx, y: by, r: cloudR,
           life: st.duration, maxLife: st.duration, dps: st.dps * this.dmgMul(),
           tick: 0, dvx: Math.cos(driftA) * 16, dvy: Math.sin(driftA) * 16,
           seed: rand(0, TAU), evolved: st.evolved,
+          slowIn: st.special.slowIn || 0, core: !!st.special.core,
         });
         break;
       }
@@ -766,26 +912,34 @@ export class Engine {
         // inscribe under the densest visible cluster; detonates after arming
         const sigR = st.radius * this.aoeMul();
         const pt = this.densestPoint(sigR);
-        const bx = pt ? pt.x : p.x + rand(-200, 200);
-        const by = pt ? pt.y : p.y + rand(-200, 200);
+        const { x: bx, y: by } = this.clampToView(pt ? pt.x : p.x + rand(-200, 200), pt ? pt.y : p.y + rand(-200, 200));
+        const armT = st.special.armFast ? 0.72 : 1.1;
         this.zones.push({
           kind: 'sigil', x: bx, y: by, r: sigR,
-          life: 1.1, maxLife: 1.1, dmg: st.damage * this.dmgMul(), sleepDur: st.sleepDur,
+          life: armT, maxLife: armT, dmg: st.damage * this.dmgMul(), sleepDur: st.sleepDur,
           echo: st.evolved,
         });
         break;
       }
       case 'lantern': {
+        // hang ghost-lanterns over the thickest knots of the horde; each
+        // pulses cold green fire until its wick runs out
         audio.lanternCast();
         const count = st.count + (this.meta.extraCount || 0);
+        const R = st.radius * this.aoeMul();
+        const dur = st.duration * (st.evolved ? 1.5 : 1);
+        const cluster = this.densestPoint(R);
         for (let i = 0; i < count; i++) {
-          const a = rand(0, TAU);
-          this.projectiles.push({
-            kind: 'lantern', x: p.x + Math.cos(a) * 26, y: p.y - 20 + Math.sin(a) * 26,
-            vx: Math.cos(a) * 60, vy: Math.sin(a) * 60 - 40,
-            speed: st.speed, dmg: st.damage * this.dmgMul() * (st.evolved ? 1.25 : 1),
-            radius: st.radius * this.aoeMul() * (st.evolved ? 1.5 : 1),
-            life: 5, r: 8, target: null, ph: rand(0, TAU),
+          const spread = i === 0 ? 14 : R * 1.1;
+          const { x: bx, y: by } = this.clampToView(
+            cluster ? cluster.x + rand(-spread, spread) : p.x + rand(-220, 220),
+            cluster ? cluster.y + rand(-spread, spread) : p.y + rand(-220, 220),
+          );
+          this.zones.push({
+            kind: 'lantern', x: bx, y: by, r: R,
+            life: dur, maxLife: dur, dmg: st.damage * this.dmgMul(),
+            tick: 0.4, int: st.evolved ? 0.4 : 0.8,
+            heal: st.special.heal || 0, ph: rand(0, TAU),
           });
         }
         break;
@@ -793,9 +947,9 @@ export class Engine {
       case 'nova': {
         audio.novaCast();
         const R = st.radius * this.aoeMul();
-        this.zones.push({ kind: 'novawave', x: p.x, y: p.y, r: 10, maxR: R, life: 0.5, maxLife: 0.5, dmg: st.damage * this.dmgMul(), knock: st.knock, hit: new Set() });
+        this.zones.push({ kind: 'novawave', x: p.x, y: p.y, r: 10, maxR: R, life: 0.5, maxLife: 0.5, dmg: st.damage * this.dmgMul(), knock: st.knock, hit: new Set(), slowGlow: !!st.special.novaSlow });
         // Endless Dusk: a second wave follows the first
-        if (st.evolved) this.zones.push({ kind: 'novawave', x: p.x, y: p.y, r: 10, maxR: R * 1.1, life: 0.5, maxLife: 0.5, delay: 0.35, dmg: st.damage * this.dmgMul() * 0.7, knock: st.knock * 0.7, hit: new Set() });
+        if (st.evolved) this.zones.push({ kind: 'novawave', x: p.x, y: p.y, r: 10, maxR: R * 1.1, life: 0.5, maxLife: 0.5, delay: 0.35, dmg: st.damage * this.dmgMul() * 0.7, knock: st.knock * 0.7, hit: new Set(), slowGlow: !!st.special.novaSlow });
         this.shake = Math.min(10, this.shake + 3);
         for (let i = 0; i < 50; i++) {
           const a = rand(0, TAU);
@@ -824,7 +978,7 @@ export class Engine {
   updateOrbitals(dt) {
     const s = this.player.spells.find((s) => s.id === 'petals');
     if (!s) return;
-    const st = this.spellStats('petals', s.level);
+    const st = this.spellStats('petals', s.level, s.mastery || 0);
     const p = this.player;
     for (const o of this.orbitals) {
       o.a += st.speed * dt * (o.dir || 1);
@@ -842,8 +996,9 @@ export class Engine {
           this.damageEnemy(e, st.damage * this.dmgMul(), '#7dffb0');
           audio.petalTick();
           const a = Math.atan2(e.y - p.y, e.x - p.x);
-          e.knbx += Math.cos(a) * 120;
-          e.knby += Math.sin(a) * 120;
+          const kn = st.special.knock2 ? 240 : 120;
+          e.knbx += Math.cos(a) * kn;
+          e.knby += Math.sin(a) * kn;
         }
       }
     }
@@ -852,6 +1007,8 @@ export class Engine {
   // -------------------------------------------------------------- damage
   damageEnemy(e, dmg, color = '#fff') {
     if (e.dead) return;
+    // Brittle Dreams: slowed foes take amplified damage
+    if (this._chillAmp && e.slowT > 0) dmg *= 1 + this._chillAmp / 100;
     let crit = false;
     if (this.meta.crit && Math.random() < this.meta.crit / 100) {
       crit = true;
@@ -879,8 +1036,10 @@ export class Engine {
       audio.fireBoom();
       this.shake = 16;
       this.flash = { color: '255,210,122', a: 0.4 };
-      for (let i = 0; i < 14; i++) this.gems.push({ x: e.x + rand(-70, 70), y: e.y + rand(-70, 70), v: 8, big: true, ph: rand(0, TAU) });
+      for (let i = 0; i < 18; i++) this.gems.push({ x: e.x + rand(-70, 70), y: e.y + rand(-70, 70), v: 14, big: true, ph: rand(0, TAU) });
       this.gems.push({ x: e.x, y: e.y, heal: true, ph: 0 });
+      // a nightmare shard — the Dark Bargain's coin, torn only from bosses
+      this.gems.push({ x: e.x + rand(-30, 30), y: e.y + rand(-30, 30), shard: true, ph: rand(0, TAU) });
       // the tide recedes: a quiet spell to collect and breathe
       this.breather = 8;
       this.setBanner('THE TIDE RECEDES', '#7ff5ff');
@@ -892,6 +1051,8 @@ export class Engine {
     } else {
       const drops = e.elite ? 4 : 1;
       for (let i = 0; i < drops; i++) this.gems.push({ x: e.x + rand(-14, 14), y: e.y + rand(-14, 14), v: e.xp, big: e.elite, ph: rand(0, TAU) });
+      // Spare Dreams: a chance at one orb more
+      if (this.meta.extraGem && Math.random() * 100 < this.meta.extraGem) this.gems.push({ x: e.x + rand(-18, 18), y: e.y + rand(-18, 18), v: e.xp, big: false, ph: rand(0, TAU) });
       if (Math.random() < 0.008) this.gems.push({ x: e.x, y: e.y, heal: true, ph: 0 });
     }
     // Stargrave: the dead burst and wound their kin
@@ -934,14 +1095,45 @@ export class Engine {
       p.dead = true;
       this.paused = true;
       audio.death();
-      this.hooks.onGameOver({ time: this.t, kills: this.kills, level: p.level, bonusDust: this.bonusDust });
+      this.hooks.onGameOver({ time: this.t, kills: this.kills, level: p.level, bonusDust: this.bonusDust, shards: this.shardsEarned });
     }
   }
 
   // -------------------------------------------------------------- update
   update(dt) {
     this.t += dt;
+    this.wake = Math.max(0, this.wake - dt);
     const p = this.player;
+
+    // dream tides: every 8s each awakened surge has a chance to swell
+    if (this.meta.surge) {
+      this.surgeT -= dt;
+      if (this.surgeT <= 0) {
+        this.surgeT = 8;
+        const dur = 4 + (this.meta.surgeDur || 0);
+        const SURGE_LOOK = {
+          speed: { str: 'SWIFTNESS SURGES', color: '#7dffb0' },
+          dmg: { str: 'POWER SURGES', color: '#ff9ad5' },
+          haste: { str: 'HASTE SURGES', color: '#7ff5ff' },
+          aoe: { str: 'THE DREAM WIDENS', color: '#c48cff' },
+          magnet: { str: 'THE LURE DEEPENS', color: '#ffd27a' },
+        };
+        let sy = 0;
+        for (const k of Object.keys(this.meta.surge)) {
+          if (this.meta.surge[k] > 0 && Math.random() * 100 < this.meta.surge[k]) {
+            this.surges[k] = dur;
+            const look = SURGE_LOOK[k];
+            this.texts.push({ x: p.x, y: p.y - 66 - sy, str: look.str, color: look.color, life: 1.3, vy: -28, size: 15 });
+            sy += 20;
+            for (let i = 0; i < 22; i++) {
+              const a = rand(0, TAU);
+              this.particles.spawn({ x: p.x, y: p.y - 12, vx: Math.cos(a) * rand(60, 220), vy: Math.sin(a) * rand(60, 220), life: rand(0.4, 0.9), size: rand(2, 5), color: look.color, mode: 'star', rotV: rand(-5, 5), drag: 0.9 });
+            }
+          }
+        }
+      }
+      for (const k of Object.keys(this.surges)) this.surges[k] = Math.max(0, this.surges[k] - dt);
+    }
 
     // input
     let mx = (this.keys['d'] || this.keys['arrowright'] ? 1 : 0) - (this.keys['a'] || this.keys['arrowleft'] ? 1 : 0);
@@ -949,8 +1141,9 @@ export class Engine {
     const L = Math.hypot(mx, my);
     if (L > 0) { mx /= L; my /= L; p.facing = mx !== 0 ? Math.sign(mx) : p.facing; }
     p.moving = L > 0;
-    p.x += mx * p.speed * dt;
-    p.y += my * p.speed * dt;
+    const spd = p.speed * (this.surges.speed > 0 ? 1.35 : 1);
+    p.x += mx * spd * dt;
+    p.y += my * spd * dt;
     p.animT += dt * (p.moving ? 2.2 : 1);
     p.iframes = Math.max(0, p.iframes - dt);
     p.castPulse = Math.max(0, p.castPulse - dt * 3);
@@ -1045,7 +1238,7 @@ export class Engine {
       }
       // ambient wisps off elites & boss
       if ((e.elite || e.boss) && Math.random() < 0.3) {
-        this.particles.spawn({ x: e.x + rand(-e.radius, e.radius), y: e.y + rand(-e.radius, e.radius), vx: rand(-20, 20), vy: rand(-40, -10), life: rand(0.4, 1), size: rand(2, 5), color: e.boss ? '#c48cff' : '#ffd27a', mode: 'glow', drag: 0.97 });
+        this.particles.spawn({ x: e.x + rand(-e.radius, e.radius), y: e.y + rand(-e.radius, e.radius), vx: rand(-20, 20), vy: rand(-40, -10), life: rand(0.4, 1), size: rand(2, 5), color: e.boss ? '#c48cff' : '#ff5a7a', mode: 'glow', drag: 0.97 });
       }
     }
     // light separation between enemies (cheap, sampled)
@@ -1099,7 +1292,7 @@ export class Engine {
         pr.y += pr.vy * dt;
         this.particles.spawn({ x: pr.x, y: pr.y, vx: rand(-10, 10), vy: rand(-10, 10), life: 0.35, size: rand(3, 6), endSize: 0.5, color: '#b48cff', color2: '#e6d1ff', mode: 'glow' });
         for (const e of this.enemies) {
-          if (e.dead) continue;
+          if (e.dead || (pr.struck && pr.struck.has(e))) continue;
           if (dist2(pr.x, pr.y, e.x, e.y) < (e.radius + pr.r) ** 2) {
             this.damageEnemy(e, pr.dmg, '#d9beff');
             for (let i = 0; i < 10; i++) this.particles.spawn({ x: pr.x, y: pr.y, vx: rand(-170, 170), vy: rand(-170, 170), life: rand(0.2, 0.5), size: rand(2, 4), color: '#e6d1ff', mode: 'star', rotV: rand(-6, 6), drag: 0.86 });
@@ -1114,6 +1307,13 @@ export class Engine {
                   turn: 9, target: this.nearestEnemy(pr.x, pr.y, 420, e), splinter: false,
                 });
               }
+            }
+            // Splinter Point: pass through and hunt a fresh target
+            if (pr.pierce > 0) {
+              pr.pierce--;
+              (pr.struck = pr.struck || new Set()).add(e);
+              pr.target = this.nearestEnemy(pr.x, pr.y, 520, e);
+              continue;
             }
             pr.life = 0;
             break;
@@ -1140,6 +1340,13 @@ export class Engine {
         if (f >= 1) {
           pr.life = 0;
           this.explode(pr.tx, pr.ty, pr.radius, pr.dmg, { ring: '#ffb3f2', core: '#ffffff', sparks: ['#ffb3f2', '#c48cff', '#8a7bff'], text: '#ffc9f5' });
+          // Meteoric Mass: the impact leaves survivors reeling
+          if (pr.stun) {
+            for (const e of this.enemies) {
+              if (e.dead || e.boss) continue;
+              if (dist2(pr.tx, pr.ty, e.x, e.y) < (pr.radius + e.radius) ** 2) { e.slow = Math.max(e.slow, 0.9); e.slowT = Math.max(e.slowT, 0.7); }
+            }
+          }
           if (pr.burn) this.zones.push({ kind: 'scorch', x: pr.tx, y: pr.ty, r: pr.radius * 0.75, life: 2.5, maxLife: 2.5, dps: pr.burn.dps, tick: 0, c1: pr.burn.c1, c2: pr.burn.c2, seed: rand(0, TAU) });
         } else pr.life = 1;
       } else if (pr.kind === 'fang') {
@@ -1182,31 +1389,9 @@ export class Engine {
           if (e.dead) continue;
           if ((pr.hitCd[e.seed] || 0) > this.t) continue;
           if (dist2(pr.x, pr.y, e.x, e.y) < (e.radius + pr.r) ** 2) {
-            pr.hitCd[e.seed] = this.t + 0.45;
+            pr.hitCd[e.seed] = this.t + (pr.hitInt || 0.45);
             this.damageEnemy(e, pr.dmg, '#bfe4ff');
             for (let i = 0; i < 5; i++) this.particles.spawn({ x: e.x, y: e.y, vx: rand(-120, 120), vy: rand(-120, 120), life: rand(0.2, 0.4), size: rand(2, 4), color: '#bfe4ff', mode: 'star', rotV: rand(-6, 6), drag: 0.88 });
-          }
-        }
-      } else if (pr.kind === 'lantern') {
-        pr.life -= dt;
-        pr.ph += dt * 5;
-        if (!pr.target || pr.target.dead) pr.target = this.nearestEnemy(pr.x, pr.y, 460);
-        if (pr.target) {
-          const D = Math.hypot(pr.target.x - pr.x, pr.target.y - pr.y) || 1;
-          pr.vx += ((pr.target.x - pr.x) / D) * 340 * dt;
-          pr.vy += ((pr.target.y - pr.y) / D) * 340 * dt;
-        }
-        const sp = Math.hypot(pr.vx, pr.vy) || 1;
-        if (sp > pr.speed) { pr.vx = (pr.vx / sp) * pr.speed; pr.vy = (pr.vy / sp) * pr.speed; }
-        pr.x += pr.vx * dt;
-        pr.y += pr.vy * dt + Math.sin(pr.ph) * 8 * dt;
-        if (Math.random() < 0.6) this.particles.spawn({ x: pr.x, y: pr.y + 4, vx: rand(-8, 8), vy: rand(-24, -6), life: rand(0.3, 0.7), size: rand(2, 4), color: '#a8ffe8', mode: 'glow', drag: 0.95 });
-        for (const e of this.enemies) {
-          if (e.dead) continue;
-          if (dist2(pr.x, pr.y, e.x, e.y) < (e.radius + pr.r) ** 2) {
-            pr.life = 0;
-            this.explode(pr.x, pr.y, pr.radius, pr.dmg, { ring: '#a8ffe8', core: '#e8fff8', sparks: ['#a8ffe8', '#4ad9c4', '#7dffb0'], text: '#a8ffe8', quiet: true });
-            break;
           }
         }
       }
@@ -1228,6 +1413,10 @@ export class Engine {
             if (!e.boss) {
               e.slow = z.slow;
               e.slowT = z.slowDur;
+            } else if (z.bossChill) {
+              // Creeping Cold: even bosses feel the bloom, at half strength
+              e.slow = z.slow * 0.5;
+              e.slowT = z.slowDur;
             }
             for (let i = 0; i < 6; i++) this.particles.spawn({ x: e.x, y: e.y, vx: rand(-60, 60), vy: rand(-90, -20), life: rand(0.4, 0.8), size: rand(3, 6), color: '#bff1ff', mode: 'shard', rotV: rand(-4, 4), drag: 0.93 });
           }
@@ -1248,7 +1437,7 @@ export class Engine {
           this.particles.spawn({ x: px, y: py, vx: (z.x - px) * 1.6 + -Math.sin(a) * 90, vy: (z.y - py) * 1.6 + Math.cos(a) * 90, life: rand(0.4, 0.8), size: rand(2, 5), color: Math.random() < 0.5 ? '#9a5cff' : '#ff9ad5', mode: 'glow', drag: 0.97 });
         }
         for (const e of this.enemies) {
-          if (e.dead || (e.boss && !z.evolved)) continue;
+          if (e.dead || (e.boss && !z.bossPull)) continue;
           const dd = dist2(z.x, z.y, e.x, e.y);
           if (dd < (z.r * 1.6) ** 2 && dd > 4) {
             const D = Math.sqrt(dd);
@@ -1288,7 +1477,14 @@ export class Engine {
           z.tick = 0.3;
           for (const e of this.enemies) {
             if (e.dead) continue;
-            if (dist2(z.x, z.y, e.x, e.y) < z.r * z.r) this.damageEnemy(e, z.dps * 0.3, '#e3bfff');
+            const dd = dist2(z.x, z.y, e.x, e.y);
+            if (dd < z.r * z.r) {
+              // Newborn Heart: the dense heart of the cloud burns double
+              const coreMul = z.core && dd < (z.r * 0.45) ** 2 ? 2 : 1;
+              this.damageEnemy(e, z.dps * 0.3 * coreMul, '#e3bfff');
+              // Whispering Mist: the cloud clings to those inside
+              if (z.slowIn && !e.boss) { e.slow = Math.max(e.slow, z.slowIn / 100); e.slowT = Math.max(e.slowT, 0.5); }
+            }
           }
         }
       } else if (z.kind === 'sigil') {
@@ -1336,9 +1532,33 @@ export class Engine {
               const a = Math.atan2(e.y - z.y, e.x - z.x);
               e.knbx += Math.cos(a) * z.knock;
               e.knby += Math.sin(a) * z.knock;
+              // Lingering Dusk: the wave leaves a slowing afterglow
+              if (z.slowGlow) { e.slow = Math.max(e.slow, 0.35); e.slowT = Math.max(e.slowT, 1.2); }
             }
           }
         }
+      } else if (z.kind === 'lantern') {
+        z.ph += dt * 4;
+        z.tick -= dt;
+        if (z.tick <= 0) {
+          z.tick = z.int;
+          let struck = false;
+          for (const e of this.enemies) {
+            if (e.dead) continue;
+            if (dist2(z.x, z.y, e.x, e.y) < (z.r + e.radius) ** 2) { this.damageEnemy(e, z.dmg, '#a8ffe8'); struck = true; }
+          }
+          this.particles.spawn({ x: z.x, y: z.y, life: 0.4, size: z.r, color: '#a8ffe8', mode: 'ring' });
+          if (struck) {
+            for (let i = 0; i < 10; i++) {
+              const a = rand(0, TAU);
+              this.particles.spawn({ x: z.x, y: z.y, vx: Math.cos(a) * rand(60, 240), vy: Math.sin(a) * rand(60, 240), life: rand(0.25, 0.55), size: rand(2, 4), color: pick(['#a8ffe8', '#4ad9c4', '#7dffb0']), mode: 'glow', drag: 0.88 });
+            }
+          }
+        }
+        // drifting ghost-motes rising off the flame
+        if (Math.random() < 0.5) this.particles.spawn({ x: z.x + rand(-6, 6), y: z.y - 10, vx: rand(-10, 10), vy: rand(-40, -14), life: rand(0.4, 0.9), size: rand(2, 4), color: '#a8ffe8', mode: 'glow', drag: 0.95 });
+        // Kindly Lights: an expiring lantern sometimes leaves a healing spark
+        if (z.life <= 0 && z.heal && Math.random() * 100 < z.heal) this.gems.push({ x: z.x, y: z.y, heal: true, ph: 0 });
       }
     }
     this.zones = this.zones.filter((z) => z.life > 0);
@@ -1373,6 +1593,47 @@ export class Engine {
     for (const b of this.bolts) b.life -= dt;
     this.bolts = this.bolts.filter((b) => b.life > 0);
 
+    // Confluence: nearby essence orbs braid together into dreamshards —
+    // and a formed shard keeps drinking in any orb that drifts near it
+    if (this.meta.gemMerge) {
+      this._mergeT -= dt;
+      if (this._mergeT <= 0) {
+        this._mergeT = 0.35;
+        const gs = this.gems;
+        for (let i = 0; i < gs.length; i++) {
+          const a = gs[i];
+          if (a.taken || a.heal || a.shard) continue;
+          const ra = a.merged ? 60 : 34;
+          for (let j = i + 1; j < gs.length; j++) {
+            const b = gs[j];
+            if (b.taken || b.heal || b.shard) continue;
+            const R = Math.max(ra, b.merged ? 60 : 34);
+            if (dist2(a.x, a.y, b.x, b.y) < R * R) {
+              a.v += b.v;
+              a.merged = true;
+              a.big = a.big || b.big;
+              b.taken = true;
+              this.particles.spawn({ x: a.x, y: a.y, life: 0.4, size: 22, color: '#e6d1ff', mode: 'ring' });
+            }
+          }
+        }
+        this.gems = gs.filter((g) => !g.taken);
+      }
+      // dreamshards exert a gentle pull, so the braid keeps growing
+      for (const g of this.gems) {
+        if (!g.merged || g.taken) continue;
+        for (const o of this.gems) {
+          if (o === g || o.taken || o.heal || o.shard || o.merged) continue;
+          const dd = dist2(g.x, g.y, o.x, o.y);
+          if (dd < 110 * 110 && dd > 1) {
+            const D = Math.sqrt(dd);
+            o.x += ((g.x - o.x) / D) * 80 * dt;
+            o.y += ((g.y - o.y) / D) * 80 * dt;
+          }
+        }
+      }
+    }
+
     // gems
     const mr = this.magnetR();
     for (const g of this.gems) {
@@ -1386,14 +1647,18 @@ export class Engine {
       }
       if (dd < 26 * 26) {
         g.taken = true;
-        if (g.heal) {
+        if (g.shard) {
+          this.shardsEarned++;
+          audio.levelUp();
+          this.texts.push({ x: p.x, y: p.y - 44, str: '+1 nightmare shard', color: '#ff7ab0', life: 1.2, vy: -36, size: 15 });
+        } else if (g.heal) {
           p.hp = Math.min(p.maxHp, p.hp + p.maxHp * 0.3);
           this.texts.push({ x: p.x, y: p.y - 40, str: '+life', color: '#7dffb0', life: 0.8, vy: -40, size: 14 });
         } else {
           this.gainXp(g.v);
           audio.gem();
         }
-        for (let i = 0; i < 8; i++) this.particles.spawn({ x: g.x, y: g.y, vx: rand(-90, 90), vy: rand(-120, -20), life: rand(0.3, 0.6), size: rand(2, 4), color: g.heal ? '#7dffb0' : '#7ff5ff', mode: 'glow', drag: 0.9 });
+        for (let i = 0; i < 8; i++) this.particles.spawn({ x: g.x, y: g.y, vx: rand(-90, 90), vy: rand(-120, -20), life: rand(0.3, 0.6), size: rand(2, 4), color: g.shard ? '#ff5a7a' : g.heal ? '#7dffb0' : '#7ff5ff', mode: 'glow', drag: 0.9 });
       }
     }
     this.gems = this.gems.filter((g) => !g.taken);
@@ -1490,6 +1755,7 @@ export class Engine {
       spells: p.spells.map((s) => ({ id: s.id, level: s.level, evolved: !!s.evolved })),
       boons: { ...p.boons },
       dust: dustForRun({ kills: this.kills, level: p.level, time: this.t, bonusDust: this.bonusDust }, this.meta),
+      shards: this.shardsEarned,
       paused: this.paused,
     }, force);
   }
@@ -1626,17 +1892,46 @@ export class Engine {
       ctx.save();
       ctx.globalAlpha = a;
       ctx.textAlign = 'center';
-      ctx.font = '700 24px Cinzel, serif';
+      ctx.font = `700 ${b.size || 24}px Cinzel, serif`;
       ctx.fillStyle = b.color;
       ctx.shadowColor = b.color;
-      ctx.shadowBlur = 18;
-      ctx.fillText(b.str, w / 2, 118);
+      ctx.shadowBlur = 18 + (b.size > 24 ? 14 : 0);
+      ctx.fillText(b.str, w / 2, 118 + ((b.size || 24) - 24) * 0.6);
       ctx.restore();
     }
 
     if (this.flash) {
       ctx.fillStyle = `rgba(${this.flash.color},${Math.max(0, this.flash.a)})`;
       ctx.fillRect(0, 0, w, h);
+    }
+
+    // dream-in: the world condenses out of pale moonlight when a run begins
+    if (this.wake > 0) {
+      const f = Math.pow(this.wake / 1.8, 1.35);
+      ctx.save();
+      const g = ctx.createRadialGradient(w / 2, h / 2, 0, w / 2, h / 2, Math.max(w, h) * 0.75);
+      g.addColorStop(0, `rgba(238,230,255,${0.95 * f})`);
+      g.addColorStop(0.45, `rgba(180,150,240,${0.8 * f})`);
+      g.addColorStop(1, `rgba(28,17,64,${0.9 * f})`);
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, w, h);
+      // a ring of waking light sweeping outward
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.globalAlpha = f * 0.8;
+      ctx.strokeStyle = '#e6d1ff';
+      ctx.lineWidth = 3;
+      ctx.shadowColor = '#b48cff';
+      ctx.shadowBlur = 30;
+      ctx.beginPath();
+      ctx.arc(w / 2, h / 2, (1 - this.wake / 1.8) * Math.max(w, h) * 0.7 + 30, 0, TAU);
+      ctx.stroke();
+      ctx.globalAlpha = Math.min(1, f * 1.6);
+      ctx.textAlign = 'center';
+      ctx.font = '700 22px Cinzel, serif';
+      ctx.fillStyle = '#e6d1ff';
+      ctx.shadowBlur = 16;
+      ctx.fillText('the dream begins…', w / 2, h / 2 - 90);
+      ctx.restore();
     }
   }
 
@@ -1693,6 +1988,73 @@ export class Engine {
     ctx.save();
     ctx.translate(x, y);
     ctx.globalCompositeOperation = 'lighter';
+    // nightmare shard: a jagged dark crystal in a crimson halo — the Dark
+    // Bargain's coin, unmistakably not essence
+    if (g.shard) {
+      const pulse = 1 + Math.sin(g.ph * 2.2) * 0.18;
+      const gl = ctx.createRadialGradient(0, 0, 0, 0, 0, 30 * pulse);
+      gl.addColorStop(0, 'rgba(255,122,176,0.9)');
+      gl.addColorStop(0.45, 'rgba(255,90,122,0.5)');
+      gl.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = gl;
+      ctx.beginPath();
+      ctx.arc(0, 0, 30 * pulse, 0, TAU);
+      ctx.fill();
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.rotate(g.ph * 0.35);
+      ctx.fillStyle = '#2a0f1e';
+      ctx.strokeStyle = '#ff5a7a';
+      ctx.lineWidth = 1.6;
+      ctx.beginPath();
+      ctx.moveTo(0, -12);
+      ctx.lineTo(7, -3);
+      ctx.lineTo(5, 10);
+      ctx.lineTo(-5, 10);
+      ctx.lineTo(-7, -3);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = '#ff7ab0';
+      ctx.beginPath();
+      ctx.moveTo(0, -6);
+      ctx.lineTo(2.8, 0);
+      ctx.lineTo(0, 6);
+      ctx.lineTo(-2.8, 0);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+      return;
+    }
+    // merged dreamshard: an iridescent six-rayed star, unmistakably richer
+    if (g.merged) {
+      const pulse = 1 + Math.sin(g.ph * 2) * 0.15;
+      const gl = ctx.createRadialGradient(0, 0, 0, 0, 0, 26 * pulse);
+      gl.addColorStop(0, '#ffffff');
+      gl.addColorStop(0.45, '#e6d1ff');
+      gl.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = gl;
+      ctx.beginPath();
+      ctx.arc(0, 0, 26 * pulse, 0, TAU);
+      ctx.fill();
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.rotate(g.ph * 0.4);
+      ctx.fillStyle = '#f4e9ff';
+      ctx.beginPath();
+      for (let k = 0; k < 6; k++) {
+        const a = (k / 6) * TAU - Math.PI / 2;
+        const a2 = a + TAU / 12;
+        ctx.lineTo(Math.cos(a) * 11 * pulse, Math.sin(a) * 11 * pulse);
+        ctx.lineTo(Math.cos(a2) * 4.6, Math.sin(a2) * 4.6);
+      }
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = '#ffd27a';
+      ctx.beginPath();
+      ctx.arc(0, 0, 2.8, 0, TAU);
+      ctx.fill();
+      ctx.restore();
+      return;
+    }
     const c = g.heal ? '#7dffb0' : g.big ? '#ffd27a' : '#7ff5ff';
     const s = g.heal ? 9 : g.big ? 8 : 5.5;
     const gl = ctx.createRadialGradient(0, 0, 0, 0, 0, s * 2.4);
@@ -1877,6 +2239,55 @@ export class Engine {
       ctx.arc(x, y, z.r * 0.9, 0, TAU);
       ctx.stroke();
       ctx.restore();
+    } else if (z.kind === 'lantern') {
+      ctx.save();
+      const fade = Math.min(1, z.life * 2, (z.maxLife - z.life) * 4);
+      const charge = 1 - Math.max(0, z.tick) / z.int; // brightens toward each pulse
+      ctx.globalCompositeOperation = 'lighter';
+      // reach of the cold fire
+      ctx.globalAlpha = fade * (0.12 + charge * 0.1);
+      const g = ctx.createRadialGradient(x, y, 0, x, y, z.r);
+      g.addColorStop(0, 'rgba(168,255,232,0.7)');
+      g.addColorStop(0.75, 'rgba(74,217,196,0.3)');
+      g.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(x, y, z.r, 0, TAU);
+      ctx.fill();
+      // faint rim so the range reads
+      ctx.globalAlpha = fade * 0.35;
+      ctx.strokeStyle = '#4ad9c4';
+      ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      ctx.arc(x, y, z.r, 0, TAU);
+      ctx.stroke();
+      // the hanging lantern itself, swaying gently above the ground
+      const sway = Math.sin(z.ph) * 3;
+      const ly = y - 26 + Math.sin(z.ph * 0.7) * 2;
+      ctx.globalAlpha = fade;
+      const flick = 0.85 + Math.sin(z.ph * 3.3) * 0.15 + charge * 0.3;
+      const lg = ctx.createRadialGradient(x + sway, ly, 0, x + sway, ly, 20 * flick);
+      lg.addColorStop(0, '#e8fff8');
+      lg.addColorStop(0.4, '#a8ffe8');
+      lg.addColorStop(1, 'rgba(0,0,0,0)');
+      ctx.fillStyle = lg;
+      ctx.beginPath();
+      ctx.arc(x + sway, ly, 20 * flick, 0, TAU);
+      ctx.fill();
+      ctx.globalCompositeOperation = 'source-over';
+      // little lantern body: cap, glass, base
+      ctx.fillStyle = '#1a3a34';
+      ctx.fillRect(x + sway - 5, ly - 11, 10, 3);
+      ctx.fillRect(x + sway - 4, ly + 8, 8, 2.5);
+      ctx.strokeStyle = '#4ad9c4';
+      ctx.lineWidth = 1.2;
+      ctx.strokeRect(x + sway - 5.5, ly - 8, 11, 16);
+      // inner flame
+      ctx.fillStyle = '#4ad9c4';
+      ctx.beginPath();
+      ctx.ellipse(x + sway, ly, 3, 4.5 + Math.sin(z.ph * 5), 0, 0, TAU);
+      ctx.fill();
+      ctx.restore();
     }
   }
 
@@ -2012,21 +2423,6 @@ export class Engine {
       ctx.fillStyle = '#ffffff';
       ctx.beginPath();
       ctx.arc(0, 0, 3.4, 0, TAU);
-      ctx.fill();
-    } else if (pr.kind === 'lantern') {
-      const flick = 0.8 + Math.sin(pr.ph * 3) * 0.2;
-      const g = ctx.createRadialGradient(x, y, 0, x, y, 16 * flick);
-      g.addColorStop(0, '#e8fff8');
-      g.addColorStop(0.4, '#a8ffe8');
-      g.addColorStop(1, 'rgba(0,0,0,0)');
-      ctx.fillStyle = g;
-      ctx.beginPath();
-      ctx.arc(x, y, 16 * flick, 0, TAU);
-      ctx.fill();
-      // little inner flame
-      ctx.fillStyle = '#4ad9c4';
-      ctx.beginPath();
-      ctx.ellipse(x, y, 3, 4.5 + Math.sin(pr.ph * 5), 0, 0, TAU);
       ctx.fill();
     }
     ctx.restore();
@@ -2300,7 +2696,8 @@ export class Engine {
     ctx.ellipse(0, e.radius * 0.55, e.radius * 0.85, e.radius * 0.3, 0, 0, TAU);
     ctx.fill();
 
-    if (e.elite || e.golden) {
+    if (e.golden) {
+      // golden wisp: warm, friendly gold halo
       ctx.save();
       ctx.globalCompositeOperation = 'lighter';
       ctx.strokeStyle = 'rgba(255,210,122,0.6)';
@@ -2310,6 +2707,39 @@ export class Engine {
       ctx.beginPath();
       ctx.arc(0, 0, e.radius + 8 + Math.sin(this.t * 4) * 2, 0, TAU);
       ctx.stroke();
+      ctx.restore();
+    } else if (e.elite) {
+      // elite: a baleful crimson corona with orbiting thorn shards — reads
+      // as a threat, never as a golden wisp's reward-glow
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.strokeStyle = 'rgba(255,90,122,0.75)';
+      ctx.lineWidth = 2.2;
+      ctx.shadowColor = '#ff5a7a';
+      ctx.shadowBlur = 14;
+      ctx.beginPath();
+      ctx.arc(0, 0, e.radius + 9 + Math.sin(this.t * 5) * 2, 0, TAU);
+      ctx.stroke();
+      ctx.strokeStyle = 'rgba(255,90,122,0.3)';
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.arc(0, 0, e.radius + 15, 0, TAU);
+      ctx.stroke();
+      ctx.fillStyle = '#ff5a7a';
+      for (let i = 0; i < 4; i++) {
+        const a = this.t * 1.8 + (i / 4) * TAU;
+        const R = e.radius + 15;
+        ctx.save();
+        ctx.translate(Math.cos(a) * R, Math.sin(a) * R);
+        ctx.rotate(a + Math.PI / 2);
+        ctx.beginPath();
+        ctx.moveTo(0, -6);
+        ctx.lineTo(3.4, 4);
+        ctx.lineTo(-3.4, 4);
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+      }
       ctx.restore();
     }
 
