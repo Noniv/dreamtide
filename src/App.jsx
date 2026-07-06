@@ -172,6 +172,11 @@ function Hud({ hud, muted, onMute }) {
             <span className="lv">{s.evolved ? '★' : s.level}</span>
           </div>
         ))}
+        {Array.from({ length: Math.max(0, (hud.spellCap || 6) - hud.spells.length) }).map((_, i) => (
+          <div key={`empty-${i}`} className="spell-chip empty" title="Empty spell slot">
+            <span className="glyph">+</span>
+          </div>
+        ))}
         {Object.entries(hud.boons).map(([id, lv]) => (
           <div key={id} className="spell-chip boon">
             <span className="glyph">{BOONS[id].icon}</span>
@@ -327,8 +332,8 @@ function nodeIcon(n) {
   }
   const ICONS = [
     ['banish', '✕'], ['reroll', '⟳'], ['fourfold', '✥'],
-    ['extraCount', '✚'], ['echo', '⧉'], ['masteryPlus', '⇑'], ['startLv', '✬'],
-    ['cheatDeath', '❥'], ['deathBurst', '✺'],
+    ['spellSlots', '▣'], ['extraCount', '✚'], ['echo', '⧉'], ['masteryPlus', '⇑'], ['startLv', '✬'],
+    ['cheatDeath', '♥'], ['deathBurst', '✺'],
     ['gemMerge', '⬢'], ['golden', '✯'], ['extraGem', '❂'],
     ['surgeAll', '∿'], ['surgeDur', '∿'], ['surgeSpeed', '➳'], ['surgeDmg', '✦'],
     ['surgeHaste', '≋'], ['surgeAoe', '◎'], ['surgeMagnet', '◉'],

@@ -67,6 +67,13 @@ body {
   box-shadow: 0 0 14px color-mix(in srgb, var(--c, #ffd27a) 30%, transparent), inset 0 0 10px rgba(0,0,0,0.5);
 }
 .spell-chip .glyph { font-size: 19px; color: var(--c, var(--gold)); text-shadow: 0 0 8px var(--c, var(--gold)); }
+.spell-chip.empty {
+  border-style: dashed;
+  border-color: rgba(205, 216, 255, 0.22);
+  background: rgba(11, 10, 30, 0.32);
+  box-shadow: inset 0 0 10px rgba(0,0,0,0.35);
+}
+.spell-chip.empty .glyph { font-size: 18px; color: rgba(205, 216, 255, 0.3); text-shadow: none; }
 .spell-chip.boon { border-color: rgba(255, 210, 122, 0.5); }
 .spell-chip.boon .glyph { color: var(--gold); text-shadow: 0 0 8px var(--gold); }
 .spell-chip .lv {

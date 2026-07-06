@@ -49,18 +49,18 @@ const ENEMY_TYPES = {
 // carry the difficulty, a minimum-alive floor, stepped HP/damage tiers and a
 // scripted event. Past the last window, tiers keep climbing gently.
 const WAVES = [
-  { t: 0, floor: 8, rate: 1.5, types: { wisp: 10 }, hp: 1.0, dmg: 1.0 },
-  { t: 45, floor: 14, rate: 1.15, types: { wisp: 10, bat: 4 }, hp: 1.15, dmg: 1.05, event: 'ring' },
-  { t: 90, floor: 22, rate: 1.0, types: { wisp: 8, bat: 8 }, hp: 1.3, dmg: 1.15 },
-  { t: 135, floor: 30, rate: 0.9, types: { bat: 8, wisp: 5, siren: 2 }, hp: 1.5, dmg: 1.25, event: 'pack' },
-  { t: 180, floor: 40, rate: 0.8, types: { bat: 6, eye: 6, siren: 3 }, hp: 1.8, dmg: 1.35, event: 'wall' },
-  { t: 240, floor: 52, rate: 0.7, types: { eye: 8, bat: 5, siren: 3 }, hp: 2.2, dmg: 1.45, event: 'ring' },
-  { t: 300, floor: 64, rate: 0.6, types: { eye: 6, shade: 6, siren: 3 }, hp: 2.7, dmg: 1.55, event: 'pack' },
-  { t: 360, floor: 78, rate: 0.55, types: { shade: 8, eye: 5, warlock: 2 }, hp: 3.3, dmg: 1.65, event: 'wall' },
-  { t: 420, floor: 92, rate: 0.5, types: { shade: 7, golem: 4, warlock: 3 }, hp: 4.0, dmg: 1.75, event: 'ring' },
-  { t: 480, floor: 106, rate: 0.45, types: { golem: 6, shade: 6, warlock: 3, siren: 2 }, hp: 4.8, dmg: 1.85, event: 'pack' },
-  { t: 540, floor: 120, rate: 0.42, types: { golem: 7, shade: 5, warlock: 4 }, hp: 5.6, dmg: 1.95, event: 'wall' },
-  { t: 600, floor: 135, rate: 0.4, types: { golem: 8, eye: 6, shade: 6, warlock: 4 }, hp: 6.5, dmg: 2.0, event: 'ring' },
+  { t: 0, floor: 10, rate: 1.25, types: { wisp: 10 }, hp: 1.0, dmg: 1.0 },
+  { t: 30, floor: 18, rate: 0.95, types: { wisp: 10, bat: 5 }, hp: 1.35, dmg: 1.15, event: 'ring' },
+  { t: 70, floor: 28, rate: 0.8, types: { wisp: 7, bat: 9, siren: 2 }, hp: 1.75, dmg: 1.3 },
+  { t: 110, floor: 38, rate: 0.7, types: { bat: 9, wisp: 4, siren: 3, eye: 3 }, hp: 2.25, dmg: 1.5, event: 'pack' },
+  { t: 155, floor: 50, rate: 0.62, types: { bat: 6, eye: 7, siren: 3 }, hp: 2.9, dmg: 1.7, event: 'wall' },
+  { t: 205, floor: 62, rate: 0.55, types: { eye: 8, bat: 5, siren: 4, shade: 2 }, hp: 3.7, dmg: 1.9, event: 'ring' },
+  { t: 260, floor: 76, rate: 0.5, types: { eye: 6, shade: 6, siren: 3, warlock: 1 }, hp: 4.7, dmg: 2.1, event: 'pack' },
+  { t: 320, floor: 90, rate: 0.46, types: { shade: 8, eye: 5, warlock: 2 }, hp: 5.9, dmg: 2.3, event: 'wall' },
+  { t: 380, floor: 104, rate: 0.43, types: { shade: 7, golem: 4, warlock: 3 }, hp: 7.3, dmg: 2.5, event: 'ring' },
+  { t: 440, floor: 120, rate: 0.4, types: { golem: 6, shade: 6, warlock: 3, siren: 2 }, hp: 9.0, dmg: 2.7, event: 'pack' },
+  { t: 500, floor: 136, rate: 0.38, types: { golem: 7, shade: 5, warlock: 4 }, hp: 11.0, dmg: 2.9, event: 'wall' },
+  { t: 560, floor: 152, rate: 0.36, types: { golem: 8, eye: 6, shade: 6, warlock: 4 }, hp: 13.5, dmg: 3.1, event: 'ring' },
 ];
 
 export class Engine {
@@ -150,7 +150,7 @@ export class Engine {
     if (m.magnet) this.player.metaMagnet = 1 + m.magnet / 100;
     if (m.startSpells) {
       for (const id of m.startSpells) {
-        if (this.player.spells.length >= 6) break;
+        if (this.player.spells.length >= this.spellCap()) break;
         if (!this.player.spells.find((s) => s.id === id)) this.player.spells.push({ id, level: 1, cd: 0.5 });
       }
     }
@@ -223,6 +223,8 @@ export class Engine {
   // real stat upgrades stop at 5; the evolution (if unlocked) is the sixth
   // step and grants the level-6 stats; beyond that only mastery (damage) grows
   statCap() { return 5; }
+  // base of 6 spell slots, widened by the constellation's spell-slot keystones
+  spellCap() { return 6 + (this.meta.spellSlots || 0); }
   evoUnlocked(id) { const m = this.meta.spellMods && this.meta.spellMods[id]; return !!(m && m.evo); }
 
   // level stats with constellation (per-spell cluster) modifiers folded in.
@@ -357,7 +359,7 @@ export class Engine {
       for (const id of Object.keys(SPELLS)) {
         if (banned('spell', id)) continue;
         const owned = p.spells.find((s) => s.id === id);
-        if (!owned && p.spells.length < 6) pushWeighted({ kind: 'spell', id, isNew: true });
+        if (!owned && p.spells.length < this.spellCap()) pushWeighted({ kind: 'spell', id, isNew: true });
         else if (owned && owned.level < this.statCap()) pushWeighted({ kind: 'spell', id, isNew: false, level: owned.level + 1 });
         // mastery: past the cap the dream deepens — pure damage, no dead ends
         else if (owned && (owned.evolved || !this.evoUnlocked(id))) pushWeighted({ kind: 'spell', id, isNew: false, mastery: true, level: (owned.mastery || 0) + 1 });
@@ -480,8 +482,7 @@ export class Engine {
       if (extra > 0) {
         return {
           ...w, idx: idx + extra,
-          hp: w.hp + extra * 1.2,
-          floor: Math.min(190, w.floor + extra * 12),
+          floor: Math.min(260, w.floor + extra * 16),
           event: ['ring', 'wall', 'pack'][extra % 3],
         };
       }
@@ -489,14 +490,31 @@ export class Engine {
     return { ...w, idx };
   }
 
+  // past minute 7 the dream unravels: an ever-climbing endgame intensity that
+  // feeds harder HP, faster foes and crueler bullet-hell. `esc` is a smooth
+  // 0..∞ ramp; individual buffs roll randomly against it so no two late runs
+  // feel the same.
+  endgame() {
+    const T = this.t + (this.meta.baneAhead || 0);
+    return Math.max(0, (T - 420) / 60); // 0 at 7:00, +1 each further minute
+  }
+
   difficulty() {
     const w = this.currentWave();
     const m = this.meta;
+    const esc = this.endgame();
     return {
-      hpMul: w.hp * (1 + (m.baneHp || 0) / 100),
-      spdMul: (1 + Math.min(0.5, this.t * 0.0008)) * (1 + (m.baneSpeed || 0) / 100),
-      rate: w.rate / (1 + (m.baneRate || 0) / 100),
-      dmgMul: w.dmg * (1 + (m.baneDmg || 0) / 100),
+      // HP climbs steeply, then runs away in the endgame (strong quadratic tail)
+      // so even a fully-kitted player is eventually outpaced.
+      hpMul: (w.hp + esc * 3.0 + esc * esc * 1.3) * (1 + (m.baneHp || 0) / 100),
+      // enemies get progressively faster so the kite eventually fails outright —
+      // by the deep endgame the swarm outruns any build — and they hit *much*
+      // harder: a cubic damage tail overwhelms even a tanky, high-regen player
+      // no matter how many iframes it has.
+      spdMul: (1 + Math.min(0.5, this.t * 0.0008)) * (1 + Math.min(6, esc * 0.28)) * (1 + (m.baneSpeed || 0) / 100),
+      rate: w.rate / (1 + (m.baneRate || 0) / 100) / (1 + Math.min(1.6, esc * 0.13)),
+      dmgMul: (w.dmg + esc * 0.8 + esc * esc * 0.18 + esc * esc * esc * 0.012) * (1 + (m.baneDmg || 0) / 100),
+      esc,
     };
   }
 
@@ -508,7 +526,15 @@ export class Engine {
     const def = ENEMY_TYPES[typeId] || ENEMY_TYPES.wisp;
     const d = this.difficulty();
     const ang = Math.random() * TAU;
-    const R = Math.max(this.cam.w, this.cam.h) * 0.62 + 60;
+    let R = Math.max(this.cam.w, this.cam.h) * 0.62 + 60;
+    // deep-endgame ambush: past the ramp, a growing share of the tide claws its
+    // way in *close* — just outside melee — so a high-DPS player can no longer
+    // mow everything down on the approach. This is the pressure that finally
+    // ends an otherwise-immortal maxed build; it can't be out-damaged, only
+    // out-moved. Never applies to bosses.
+    if (!boss && d.esc > 2 && Math.random() < Math.min(0.42, (d.esc - 2) * 0.038)) {
+      R = rand(90, 150);
+    }
     const mul = boss ? 1 : elite ? 7 : 1;
     const e = {
       type: typeId, boss,
@@ -524,6 +550,30 @@ export class Engine {
       slow: 0, slowT: 0, hitFlash: 0, animT: Math.random() * 10, seed: Math.random() * 1000,
       knbx: 0, knby: 0,
     };
+    // endgame variance: past minute 7, each foe rolls its own extra menace, so
+    // late waves feel wilder and less predictable. Non-boss enemies may surge
+    // in speed; ranged foes may reach farther, shoot faster projectiles, or
+    // loose more of them at once.
+    const esc = d.esc;
+    if (esc > 0 && !boss) {
+      // a fraction of enemies become notably swifter (capped so it stays fair)
+      if (Math.random() < Math.min(0.6, 0.12 + esc * 0.05)) {
+        e.speed *= 1 + rand(0.15, 0.15 + Math.min(0.55, esc * 0.06));
+      }
+      const rdef = def.ranged;
+      if (rdef) {
+        // roll a personal ranged profile off the base type
+        const rangeF = 1 + rand(0, Math.min(1.0, esc * 0.09));
+        const speedF = 1 + rand(0, Math.min(1.3, esc * 0.12));
+        const extraShots = Math.random() < Math.min(0.7, esc * 0.08) ? 1 + ((Math.random() * Math.min(3, esc * 0.25)) | 0) : 0;
+        e.ranged = {
+          range: rdef.range * rangeF,
+          cd: rdef.cd / (1 + Math.min(0.5, esc * 0.03)),
+          projSpeed: rdef.projSpeed * speedF,
+          shots: rdef.shots + extraShots,
+        };
+      }
+    }
     e.maxHp = e.hp;
     this.enemies.push(e);
     if (boss) {
@@ -531,8 +581,68 @@ export class Engine {
       this.flash = { color: '154,92,255', a: 0.35 };
       this.setBanner('☽  THE DEVOURER STIRS  ☾', '#c48cff', 4.2, 38);
       this.texts.push({ x: e.x, y: e.y - 60, str: 'THE DEVOURER STIRS', color: '#c48cff', life: 2.4, vy: -12, size: 22 });
+      // each boss carries a bullet-hell profile that intensifies with bossCount
+      const n = this.bossCount; // 1-based (incremented before spawn)
+      e.bossFire = {
+        cd: 0,
+        interval: Math.max(0.7, 1.9 - n * 0.12),      // fires faster over time
+        speed: 120 + n * 12,                           // bullets fly faster
+        spin: rand(0, TAU),
+        spinV: (n % 2 ? 1 : -1) * (0.5 + n * 0.08),    // rotating spiral rate
+        // pattern rotation: later bosses layer more dangerous patterns in
+        patterns: n <= 1 ? ['aimed'] : n <= 3 ? ['aimed', 'spiral'] : n <= 5 ? ['aimed', 'spiral', 'ring'] : ['aimed', 'spiral', 'ring', 'cross'],
+        pIdx: 0,
+      };
     }
     return e;
+  }
+
+  // drive one boss's bullet-hell. Patterns are dense but always leave gaps to
+  // slip through — the challenge is reading them, not surviving a wall.
+  updateBossFire(e, dt) {
+    const p = this.player;
+    const bf = e.bossFire || (e.bossFire = { cd: 0, interval: 1.6, speed: 130, spin: 0, spinV: 0.6, patterns: ['aimed'], pIdx: 0 });
+    const n = this.bossCount;
+    bf.spin += bf.spinV * dt;
+    bf.cd -= dt;
+    if (bf.cd > 0) return;
+    bf.cd = bf.interval * rand(0.9, 1.1);
+    const pat = bf.patterns[bf.pIdx % bf.patterns.length];
+    bf.pIdx++;
+    const baseA = Math.atan2(p.y - e.y, p.x - e.x);
+    const dmg = 12 + n * 3 + this.endgame() * 4;
+    const shoot = (ang, spd, r = 6) => this.bossProjectiles.push({
+      x: e.x, y: e.y, vx: Math.cos(ang) * spd, vy: Math.sin(ang) * spd, life: 16, r, dmg,
+    });
+    if (pat === 'aimed') {
+      // a fanned volley aimed at the player — wide enough to force movement,
+      // with a clear centre gap on the higher tiers
+      const shots = 3 + Math.min(8, Math.floor(n * 0.7));
+      const arc = 0.28;
+      for (let i = 0; i < shots; i++) {
+        const f = shots > 1 ? (i / (shots - 1) - 0.5) : 0;
+        shoot(baseA + f * arc * shots, bf.speed * rand(0.95, 1.1));
+      }
+    } else if (pat === 'spiral') {
+      // slowly rotating arms — dense in motion but every arm is dodgeable
+      const arms = 2 + Math.min(4, Math.floor(n / 2));
+      for (let i = 0; i < arms; i++) shoot(bf.spin + (i / arms) * TAU, bf.speed * 0.9);
+    } else if (pat === 'ring') {
+      // an omni ring with one deliberate gap the player can run to
+      const count = 10 + Math.min(20, Math.floor(n * 1.5));
+      const gap = Math.floor(rand(0, count));
+      const gapW = 2; // width of the safe corridor, in bullets
+      for (let i = 0; i < count; i++) {
+        if (Math.abs(((i - gap + count) % count)) < gapW) continue;
+        shoot(bf.spin + (i / count) * TAU, bf.speed * 0.85);
+      }
+    } else if (pat === 'cross') {
+      // a rotating four-pointed cross of fast bullets — read the sweep, step out
+      for (let k = 0; k < 4; k++) {
+        const base = bf.spin + k * (TAU / 4);
+        for (let j = -1; j <= 1; j++) shoot(base + j * 0.12, bf.speed * 1.25);
+      }
+    }
   }
 
   updateSpawning(dt) {
@@ -558,16 +668,22 @@ export class Engine {
     } else {
       this.spawnTimer -= dt;
       const alive = this.enemies.length;
-      const floor = w.floor + (this.meta.baneFloor || 0);
-      const rate = w.rate / (1 + (this.meta.baneRate || 0) / 100);
+      const esc = this.endgame();
+      // the endgame tide swells relentlessly: the minimum-alive floor climbs
+      // and the field refills faster and in bigger gulps, so a high-DPS player
+      // can no longer keep the screen clear — sheer numbers close the gap.
+      const escFloor = Math.floor(esc * esc * 2.2);
+      const floor = w.floor + (this.meta.baneFloor || 0) + escFloor;
+      const rate = w.rate / (1 + (this.meta.baneRate || 0) / 100) / (1 + Math.min(2.5, esc * 0.2));
+      const cap = Math.min(420, 230 + escFloor);
       if (alive < floor && this.spawnTimer <= 0) {
-        // refill quickly up to the wave's floor
-        this.spawnTimer = 0.2;
-        const n = Math.min(6, floor - alive);
+        // refill toward the floor — faster and in larger batches late-game
+        this.spawnTimer = Math.max(0.08, 0.2 - esc * 0.01);
+        const n = Math.min(6 + Math.floor(esc * 1.5), floor - alive);
         for (let i = 0; i < n; i++) this.spawnEnemy(pickType());
-      } else if (this.spawnTimer <= 0 && alive < 230) {
+      } else if (this.spawnTimer <= 0 && alive < cap) {
         this.spawnTimer = rate * rand(0.7, 1.3);
-        const burst = 1 + ((Math.random() * 3) | 0);
+        const burst = 1 + ((Math.random() * 3) | 0) + Math.floor(esc * 0.6);
         for (let i = 0; i < burst; i++) this.spawnEnemy(pickType());
       }
       if (!this._waveEventDone && this.t >= this._waveEventAt) {
@@ -1182,7 +1298,7 @@ export class Engine {
       }
       const a = Math.atan2(p.y - e.y, p.x - e.x);
       const wob = Math.sin(e.animT * 3 + e.seed) * 0.4;
-      const rangedDef = !e.boss && ENEMY_TYPES[e.type].ranged;
+      const rangedDef = !e.boss && (e.ranged || ENEMY_TYPES[e.type].ranged);
       if (rangedDef) {
         // hover at range: advance when far, retreat when crowded, strafe between
         const D = Math.sqrt(dist2(e.x, e.y, p.x, p.y));
@@ -1216,26 +1332,8 @@ export class Engine {
       e.knby *= Math.pow(0.02, dt);
       // contact damage
       if (dist2(e.x, e.y, p.x, p.y) < (e.radius + 15) ** 2) this.hurtPlayer(e.dmg);
-      // boss bullet-hell
-      if (e.boss) {
-        e._shootCd = (e._shootCd || 0) - dt;
-        if (e._shootCd <= 0) {
-          e._shootCd = 1.8 + rand(-0.2, 0.2);
-          const count = 6 + Math.floor(this.bossCount * 1.5);
-          const spread = TAU / count;
-          const baseA = Math.atan2(p.y - e.y, p.x - e.x);
-          for (let i = 0; i < count; i++) {
-            const a = baseA + (i - count / 2) * spread + rand(-0.08, 0.08);
-            this.bossProjectiles.push({
-              x: e.x, y: e.y,
-              vx: Math.cos(a) * 130,
-              vy: Math.sin(a) * 130,
-              life: 16,
-              r: 6,
-            });
-          }
-        }
-      }
+      // boss bullet-hell — each successive Devourer is more demanding
+      if (e.boss) this.updateBossFire(e, dt);
       // ambient wisps off elites & boss
       if ((e.elite || e.boss) && Math.random() < 0.3) {
         this.particles.spawn({ x: e.x + rand(-e.radius, e.radius), y: e.y + rand(-e.radius, e.radius), vx: rand(-20, 20), vy: rand(-40, -10), life: rand(0.4, 1), size: rand(2, 5), color: e.boss ? '#c48cff' : '#ff5a7a', mode: 'glow', drag: 0.97 });
@@ -1547,7 +1645,9 @@ export class Engine {
             if (e.dead) continue;
             if (dist2(z.x, z.y, e.x, e.y) < (z.r + e.radius) ** 2) { this.damageEnemy(e, z.dmg, '#a8ffe8'); struck = true; }
           }
-          this.particles.spawn({ x: z.x, y: z.y, life: 0.4, size: z.r, color: '#a8ffe8', mode: 'ring' });
+          // a soft cold-fire swell where the lantern pulses — a filled glow
+          // that blooms and fades, gentler than a hard expanding ring
+          this.particles.spawn({ x: z.x, y: z.y, life: 0.5, size: z.r * 0.62, endSize: z.r * 0.9, color: 'rgba(168,255,232,0.5)', color2: 'rgba(74,217,196,0.12)', mode: 'glow', drag: 1 });
           if (struck) {
             for (let i = 0; i < 10; i++) {
               const a = rand(0, TAU);
@@ -1599,21 +1699,22 @@ export class Engine {
       this._mergeT -= dt;
       if (this._mergeT <= 0) {
         this._mergeT = 0.35;
+        // any two orbs within ~60px braid together; a merged orb keeps
+        // absorbing others it meets, so shards grow without limit
+        const MERGE_R = 60;
         const gs = this.gems;
         for (let i = 0; i < gs.length; i++) {
           const a = gs[i];
           if (a.taken || a.heal || a.shard) continue;
-          const ra = a.merged ? 60 : 34;
           for (let j = i + 1; j < gs.length; j++) {
             const b = gs[j];
             if (b.taken || b.heal || b.shard) continue;
-            const R = Math.max(ra, b.merged ? 60 : 34);
-            if (dist2(a.x, a.y, b.x, b.y) < R * R) {
+            if (dist2(a.x, a.y, b.x, b.y) < MERGE_R * MERGE_R) {
               a.v += b.v;
               a.merged = true;
               a.big = a.big || b.big;
               b.taken = true;
-              this.particles.spawn({ x: a.x, y: a.y, life: 0.4, size: 22, color: '#e6d1ff', mode: 'ring' });
+              this.particles.spawn({ x: a.x, y: a.y, life: 0.35, size: 12, color: '#cbb6ff', mode: 'glow', drag: 1 });
             }
           }
         }
@@ -1625,10 +1726,10 @@ export class Engine {
         for (const o of this.gems) {
           if (o === g || o.taken || o.heal || o.shard || o.merged) continue;
           const dd = dist2(g.x, g.y, o.x, o.y);
-          if (dd < 110 * 110 && dd > 1) {
+          if (dd < 100 * 100 && dd > 1) {
             const D = Math.sqrt(dd);
-            o.x += ((g.x - o.x) / D) * 80 * dt;
-            o.y += ((g.y - o.y) / D) * 80 * dt;
+            o.x += ((g.x - o.x) / D) * 70 * dt;
+            o.y += ((g.y - o.y) / D) * 70 * dt;
           }
         }
       }
@@ -1753,6 +1854,7 @@ export class Engine {
       hp: p.hp, maxHp: p.maxHp, xp: p.xp, xpNext: p.xpNext, level: p.level,
       time: this.t, kills: this.kills,
       spells: p.spells.map((s) => ({ id: s.id, level: s.level, evolved: !!s.evolved })),
+      spellCap: this.spellCap(),
       boons: { ...p.boons },
       dust: dustForRun({ kills: this.kills, level: p.level, time: this.t, bonusDust: this.bonusDust }, this.meta),
       shards: this.shardsEarned,
@@ -2025,32 +2127,30 @@ export class Engine {
       ctx.restore();
       return;
     }
-    // merged dreamshard: an iridescent six-rayed star, unmistakably richer
+    // merged dreamshard: like a normal essence orb but with a cooler violet
+    // tint and a faint inner spark — richer, yet unobtrusive
     if (g.merged) {
-      const pulse = 1 + Math.sin(g.ph * 2) * 0.15;
-      const gl = ctx.createRadialGradient(0, 0, 0, 0, 0, 26 * pulse);
-      gl.addColorStop(0, '#ffffff');
-      gl.addColorStop(0.45, '#e6d1ff');
+      const s = 6.5;
+      const gl = ctx.createRadialGradient(0, 0, 0, 0, 0, s * 2.4);
+      gl.addColorStop(0, '#e6d1ff');
       gl.addColorStop(1, 'rgba(0,0,0,0)');
       ctx.fillStyle = gl;
       ctx.beginPath();
-      ctx.arc(0, 0, 26 * pulse, 0, TAU);
+      ctx.arc(0, 0, s * 2.4, 0, TAU);
       ctx.fill();
       ctx.globalCompositeOperation = 'source-over';
-      ctx.rotate(g.ph * 0.4);
-      ctx.fillStyle = '#f4e9ff';
+      ctx.rotate(g.ph * 0.5);
+      ctx.fillStyle = '#c8a8ff';
       ctx.beginPath();
-      for (let k = 0; k < 6; k++) {
-        const a = (k / 6) * TAU - Math.PI / 2;
-        const a2 = a + TAU / 12;
-        ctx.lineTo(Math.cos(a) * 11 * pulse, Math.sin(a) * 11 * pulse);
-        ctx.lineTo(Math.cos(a2) * 4.6, Math.sin(a2) * 4.6);
-      }
+      ctx.moveTo(0, -s);
+      ctx.lineTo(s * 0.62, 0);
+      ctx.lineTo(0, s);
+      ctx.lineTo(-s * 0.62, 0);
       ctx.closePath();
       ctx.fill();
-      ctx.fillStyle = '#ffd27a';
+      ctx.fillStyle = '#fff';
       ctx.beginPath();
-      ctx.arc(0, 0, 2.8, 0, TAU);
+      ctx.arc(0, 0, 1.6, 0, TAU);
       ctx.fill();
       ctx.restore();
       return;
@@ -2242,30 +2342,26 @@ export class Engine {
     } else if (z.kind === 'lantern') {
       ctx.save();
       const fade = Math.min(1, z.life * 2, (z.maxLife - z.life) * 4);
-      const charge = 1 - Math.max(0, z.tick) / z.int; // brightens toward each pulse
+      // a slow, gentle breathing rather than a sharp charge toward each pulse
+      const breath = 0.5 + 0.5 * Math.sin(z.ph * 0.9);
       ctx.globalCompositeOperation = 'lighter';
-      // reach of the cold fire
-      ctx.globalAlpha = fade * (0.12 + charge * 0.1);
+      // reach of the cold fire: a soft, hazy pool that fades out well before
+      // its edge — no hard rim, so the eye rests on it
+      ctx.globalAlpha = fade * (0.07 + breath * 0.03);
       const g = ctx.createRadialGradient(x, y, 0, x, y, z.r);
-      g.addColorStop(0, 'rgba(168,255,232,0.7)');
-      g.addColorStop(0.75, 'rgba(74,217,196,0.3)');
+      g.addColorStop(0, 'rgba(168,255,232,0.55)');
+      g.addColorStop(0.45, 'rgba(120,230,205,0.22)');
+      g.addColorStop(0.8, 'rgba(74,217,196,0.06)');
       g.addColorStop(1, 'rgba(0,0,0,0)');
       ctx.fillStyle = g;
       ctx.beginPath();
       ctx.arc(x, y, z.r, 0, TAU);
       ctx.fill();
-      // faint rim so the range reads
-      ctx.globalAlpha = fade * 0.35;
-      ctx.strokeStyle = '#4ad9c4';
-      ctx.lineWidth = 1.4;
-      ctx.beginPath();
-      ctx.arc(x, y, z.r, 0, TAU);
-      ctx.stroke();
       // the hanging lantern itself, swaying gently above the ground
       const sway = Math.sin(z.ph) * 3;
       const ly = y - 26 + Math.sin(z.ph * 0.7) * 2;
-      ctx.globalAlpha = fade;
-      const flick = 0.85 + Math.sin(z.ph * 3.3) * 0.15 + charge * 0.3;
+      ctx.globalAlpha = fade * 0.9;
+      const flick = 0.9 + Math.sin(z.ph * 2.6) * 0.08 + breath * 0.14;
       const lg = ctx.createRadialGradient(x + sway, ly, 0, x + sway, ly, 20 * flick);
       lg.addColorStop(0, '#e8fff8');
       lg.addColorStop(0.4, '#a8ffe8');

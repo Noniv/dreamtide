@@ -104,7 +104,7 @@ const ARMS = {
       { n: 'Distant Light', d: '+6% spell damage', fx: { dmg: 6 } },
       { n: 'Horizon Line', d: '+8% area of effect', fx: { aoe: 8 } },
     ],
-    branch: { n: 'Deep Field', d: '+10% area, +6% damage', fx: { aoe: 10, dmg: 6 } },
+    branch: { n: 'Unbound Firmament', d: '+1 spell slot — hold one more spell at once', fx: { spellSlots: 1 } },
     end: { n: 'Cosmic Attunement', d: 'Mastery upgrades grant +12% damage instead of +8%', fx: { masteryPlus: 4 } },
   },
   tides: {
@@ -154,7 +154,7 @@ const ARMS = {
       { n: 'Scattered Sleep', d: '+5% bonus orb chance', fx: { extraGem: 5 } },
       { n: 'Tithe of Night', d: '+6% bonus orb chance', fx: { extraGem: 6 } },
     ],
-    branch: { n: 'Overflowing Essence', d: '+10% bonus orb chance, +10% essence', fx: { extraGem: 10, xp: 10 } },
+    branch: { n: 'Boundless Reverie', d: '+1 spell slot — hold one more spell at once', fx: { spellSlots: 1 } },
     end: { n: 'Golden Dream', d: 'Golden wisps visit twice as often', fx: { golden: 1 } },
   },
   fortune: {
@@ -229,7 +229,7 @@ const ARMS = {
       { n: 'The Third Refusal', d: 'You may banish one more offer each dream', fx: { banish: 1 } },
       { n: 'Turning Page', d: 'You may reroll one more set of choices each dream', fx: { reroll: 1 } },
     ],
-    branch: { n: 'Stargrave', d: 'Slain foes burst, wounding those nearby', fx: { deathBurst: 1 } },
+    branch: { n: 'Widening Loom', d: '+1 spell slot — hold one more spell at once', fx: { spellSlots: 1 } },
     end: { n: 'Fourfold Path', d: 'Level-ups offer a fourth choice', fx: { fourfold: 1 } },
   },
 };
@@ -545,19 +545,19 @@ CLUSTER_ORDER.forEach((spellId, k) => {
 const DARK_CX = 0, DARK_CY = CLUSTER_DIST;
 const DARK_NODES = [
   // 8-node star outline (tips + inner notches), clockwise from the top tip
-  { p: [0, -112], kind: 'small', cost: 1, n: 'The Dark Bargain', d: '+10% stardust earned · enemies have +10% life', fx: { dust: 10, baneHp: 10 }, entry: true },
-  { p: [28, -28], kind: 'small', cost: 1, n: 'Restless Horde', d: '+10% stardust earned · the tide spawns 10% faster', fx: { dust: 10, baneRate: 10 } },
-  { p: [112, 0], kind: 'notable', cost: 2, n: 'Cruel Dawn', d: '+15% stardust earned · the dream begins 60 seconds deeper', fx: { dust: 15, baneAhead: 60 } },
-  { p: [28, 28], kind: 'small', cost: 1, n: 'Sharpened Nightmares', d: '+10% stardust earned · enemies strike 10% harder', fx: { dust: 10, baneDmg: 10 } },
-  { p: [0, 112], kind: 'notable', cost: 2, n: 'Deep Tide', d: '+15% stardust earned · at least 6 more enemies swarm you at all times', fx: { dust: 15, baneFloor: 6 } },
-  { p: [-28, 28], kind: 'small', cost: 1, n: 'Fleet Shadows', d: '+10% stardust earned · enemies move 8% faster', fx: { dust: 10, baneSpeed: 8 } },
-  { p: [-112, 0], kind: 'notable', cost: 2, n: 'Hungry Dark', d: '+15% stardust earned · elites stir 25% more often', fx: { dust: 15, baneElite: 25 } },
-  { p: [-28, -28], kind: 'small', cost: 1, n: 'Iron Dreams', d: '+10% stardust earned · enemies have +12% life', fx: { dust: 10, baneHp: 12 } },
+  { p: [0, -112], kind: 'small', cost: 1, n: 'The Dark Bargain', d: '+12% stardust earned · enemies have +20% life', fx: { dust: 12, baneHp: 20 }, entry: true },
+  { p: [28, -28], kind: 'small', cost: 1, n: 'Restless Horde', d: '+12% stardust earned · the tide spawns 20% faster', fx: { dust: 12, baneRate: 20 } },
+  { p: [112, 0], kind: 'notable', cost: 2, n: 'Cruel Dawn', d: '+18% stardust earned · the dream begins 120 seconds deeper', fx: { dust: 18, baneAhead: 120 } },
+  { p: [28, 28], kind: 'small', cost: 1, n: 'Sharpened Nightmares', d: '+12% stardust earned · enemies strike 20% harder', fx: { dust: 12, baneDmg: 20 } },
+  { p: [0, 112], kind: 'notable', cost: 2, n: 'Deep Tide', d: '+18% stardust earned · at least 12 more enemies swarm you at all times', fx: { dust: 18, baneFloor: 12 } },
+  { p: [-28, 28], kind: 'small', cost: 1, n: 'Fleet Shadows', d: '+12% stardust earned · enemies move 15% faster', fx: { dust: 12, baneSpeed: 15 } },
+  { p: [-112, 0], kind: 'notable', cost: 2, n: 'Hungry Dark', d: '+18% stardust earned · elites stir 50% more often', fx: { dust: 18, baneElite: 50 } },
+  { p: [-28, -28], kind: 'small', cost: 1, n: 'Iron Dreams', d: '+12% stardust earned · enemies have +22% life', fx: { dust: 12, baneHp: 22 } },
   // heart + three inner motes
-  { p: [0, 0], kind: 'keystone', cost: 4, n: 'The Black Star', d: '+30% stardust earned · enemies have +15% life and strike 10% harder', fx: { dust: 30, baneHp: 15, baneDmg: 10 } },
-  { p: [0, -64], kind: 'small', cost: 1, n: 'Toll of Night', d: '+10% stardust earned · at least 4 more enemies swarm you at all times', fx: { dust: 10, baneFloor: 4 } },
-  { p: [64, 0], kind: 'notable', cost: 2, n: 'Devourer’s Haste', d: '+15% stardust earned · the Devourer comes 25% sooner', fx: { dust: 15, baneBoss: 25 } },
-  { p: [-64, 0], kind: 'small', cost: 1, n: 'Thin Veil', d: '+10% stardust earned · the tide spawns 10% faster', fx: { dust: 10, baneRate: 10 } },
+  { p: [0, 0], kind: 'keystone', cost: 4, n: 'The Black Star', d: '+45% stardust earned · enemies have +30% life and strike 25% harder', fx: { dust: 45, baneHp: 30, baneDmg: 25 } },
+  { p: [0, -64], kind: 'small', cost: 1, n: 'Toll of Night', d: '+12% stardust earned · at least 8 more enemies swarm you at all times', fx: { dust: 12, baneFloor: 8 } },
+  { p: [64, 0], kind: 'notable', cost: 2, n: 'Devourer’s Haste', d: '+18% stardust earned · the Devourer comes 40% sooner', fx: { dust: 18, baneBoss: 40 } },
+  { p: [-64, 0], kind: 'small', cost: 1, n: 'Thin Veil', d: '+12% stardust earned · the tide spawns 18% faster', fx: { dust: 12, baneRate: 18 } },
 ];
 const DARK_EDGES = [[0, 1], [1, 2], [2, 3], [3, 4], [4, 5], [5, 6], [6, 7], [7, 0], [0, 9], [9, 8], [8, 10], [10, 2], [8, 11], [11, 6], [4, 8]];
 {
@@ -717,7 +717,7 @@ export function computeBonuses(meta) {
     dmg: 0, cast: 0, aoe: 0, speed: 0, magnet: 0, xp: 0, dust: 0, crit: 0, critDmg: 0,
     hp: 0, regen: 0, extraCount: 0, echo: 0, masteryPlus: 0, startLv: 0, fourfold: 0,
     cheatDeath: 0, deathBurst: 0, banish: 0, reroll: 0, extraGem: 0, gemMerge: 0,
-    golden: 0, surgeDur: 0,
+    golden: 0, surgeDur: 0, spellSlots: 0,
     surge: { speed: 0, dmg: 0, haste: 0, aoe: 0, magnet: 0 },
     startSpells: [], spellMods: {},
   };

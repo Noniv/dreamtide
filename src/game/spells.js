@@ -220,8 +220,8 @@ export const SPELLS = {
     desc: 'Hang ghost-lanterns over the horde that pulse with cold green fire.',
     maxLevel: 6,
     stats: (lv) => ({
-      cooldown: Math.max(2.2, 4.2 - lv * 0.35),
-      damage: 14 + lv * 7,
+      cooldown: Math.max(4.2, 7 - lv * 0.45),
+      damage: 8 + lv * 4,
       count: 1 + Math.floor(lv / 2),
       radius: 85 + lv * 12,
       duration: 3 + lv * 0.4,
