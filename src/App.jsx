@@ -1,4 +1,4 @@
-import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { create } from 'zustand';
 import { Engine } from './game/engine.js';
 import { SPELLS, BOONS, GENERIC, EVOLVE } from './game/spells.js';
@@ -347,35 +347,91 @@ function nodeIcon(n) {
 
 const TREE_VIEW = 2480; // viewBox span
 
+// Static edge geometry — the tree never moves, so compute each edge's shape and
+// endpoints once at module load rather than on every render/pan.
+const EDGE_GEOM = TREE_EDGES.map(([a, b, bend]) => {
+  const na = NODE_MAP[a], nb = NODE_MAP[b];
+  if (!na || !nb) return null;
+  const dark = a.startsWith('dark-') && b.startsWith('dark-');
+  let d = null, line = null;
+  if (!bend) {
+    line = { x1: na.x, y1: na.y, x2: nb.x, y2: nb.y };
+  } else {
+    const mx = (na.x + nb.x) / 2, my = (na.y + nb.y) / 2;
+    const dx = nb.x - na.x, dy = nb.y - na.y;
+    const len = Math.hypot(dx, dy) || 1;
+    const cx = mx + (-dy / len) * bend, cy = my + (dx / len) * bend;
+    d = `M ${na.x} ${na.y} Q ${cx} ${cy} ${nb.x} ${nb.y}`;
+  }
+  return { a, b, dark, d, line };
+}).filter(Boolean);
+
+// Edge layer, memoized so it only re-renders when ownership changes (not on
+// pan, zoom, or tooltip hover).
+const TreeEdges = React.memo(function TreeEdges({ owned }) {
+  return EDGE_GEOM.map((e, i) => {
+    const lit = owned.has(e.a) && owned.has(e.b);
+    const half = !lit && (owned.has(e.a) || owned.has(e.b));
+    const cls = `tree-edge ${e.dark ? 'dark ' : ''}${lit ? 'lit' : half ? 'half' : ''}`;
+    return e.line
+      ? <line key={i} x1={e.line.x1} y1={e.line.y1} x2={e.line.x2} y2={e.line.y2} className={cls} />
+      : <path key={i} d={e.d} className={cls} />;
+  });
+});
+
 function SkillTree({ meta, onBuy, onRefund, onClose, leaving }) {
   const [tip, setTip] = useState(null); // { id, x, y } in viewport coords
+  // `view` is the committed pan/zoom; while dragging we bypass React entirely
+  // and mutate the group transform imperatively, so the ~1500 SVG elements
+  // never re-render mid-drag. viewRef mirrors the live value between commits.
   const [view, setView] = useState({ x: 0, y: 0, z: 1 });
+  const viewRef = useRef(view);
+  const gRef = useRef(null);
   const dragRef = useRef(null);
-  const owned = new Set(meta.owned);
+  // rebuild the owned-set only when the owned list actually changes
+  const owned = useMemo(() => new Set(meta.owned), [meta.owned]);
   const node = tip ? NODE_MAP[tip.id] : null;
 
+  const applyTransform = (v) => {
+    if (gRef.current) gRef.current.setAttribute('transform', `translate(${v.x} ${v.y}) scale(${v.z})`);
+  };
+
   const hover = (n) => (e) => {
+    if (dragRef.current && dragRef.current.moved) return; // don't pop tips mid-pan
     const r = e.currentTarget.getBoundingClientRect();
     setTip({ id: n.id, x: r.left + r.width / 2, y: r.top });
   };
 
   const onWheel = (e) => {
-    const z = Math.min(3.2, Math.max(0.55, view.z * (e.deltaY < 0 ? 1.15 : 0.87)));
-    setView((v) => ({ ...v, z }));
+    const v = viewRef.current;
+    const z = Math.min(3.2, Math.max(0.55, v.z * (e.deltaY < 0 ? 1.15 : 0.87)));
+    const next = { ...v, z };
+    viewRef.current = next;
+    applyTransform(next);
+    setView(next);
   };
   const onMouseDown = (e) => {
-    dragRef.current = { sx: e.clientX, sy: e.clientY, ox: view.x, oy: view.y, moved: false };
+    const v = viewRef.current;
+    dragRef.current = { sx: e.clientX, sy: e.clientY, ox: v.x, oy: v.y, moved: false };
   };
   const onMouseMove = (e) => {
     const d = dragRef.current;
     if (!d) return;
     const dx = e.clientX - d.sx, dy = e.clientY - d.sy;
-    if (Math.abs(dx) + Math.abs(dy) > 5) d.moved = true;
+    if (Math.abs(dx) + Math.abs(dy) > 5) { if (!d.moved) setTip(null); d.moved = true; }
     if (!d.moved) return;
     const k = TREE_VIEW / e.currentTarget.clientWidth;
-    setView((v) => ({ ...v, x: d.ox + dx * k, y: d.oy + dy * k }));
+    // pan imperatively — no setState, no re-render of the tree
+    const next = { x: d.ox + dx * k, y: d.oy + dy * k, z: viewRef.current.z };
+    viewRef.current = next;
+    applyTransform(next);
   };
-  const endDrag = () => { setTimeout(() => { dragRef.current = null; }, 0); };
+  const endDrag = () => {
+    const d = dragRef.current;
+    // commit the imperative pan back into React state, once
+    if (d && d.moved) setView(viewRef.current);
+    setTimeout(() => { dragRef.current = null; }, 0);
+  };
   const wasDrag = () => dragRef.current && dragRef.current.moved;
 
   return (
@@ -402,22 +458,10 @@ function SkillTree({ meta, onBuy, onRefund, onClose, leaving }) {
           onMouseUp={endDrag}
           onMouseLeave={endDrag}
         >
-          <g transform={`translate(${view.x} ${view.y}) scale(${view.z})`}>
-          {/* edges — an optional bend curves the line to follow a cluster's shape */}
-          {TREE_EDGES.map(([a, b, bend], i) => {
-            const na = NODE_MAP[a], nb = NODE_MAP[b];
-            if (!na || !nb) return null;
-            const lit = owned.has(a) && owned.has(b);
-            const half = owned.has(a) || owned.has(b);
-            const dark = a.startsWith('dark-') && b.startsWith('dark-');
-            const cls = `tree-edge ${dark ? 'dark ' : ''}${lit ? 'lit' : half ? 'half' : ''}`;
-            if (!bend) return <line key={i} x1={na.x} y1={na.y} x2={nb.x} y2={nb.y} className={cls} />;
-            const mx = (na.x + nb.x) / 2, my = (na.y + nb.y) / 2;
-            const dx = nb.x - na.x, dy = nb.y - na.y;
-            const len = Math.hypot(dx, dy) || 1;
-            const cx = mx + (-dy / len) * bend, cy = my + (dx / len) * bend;
-            return <path key={i} d={`M ${na.x} ${na.y} Q ${cx} ${cy} ${nb.x} ${nb.y}`} className={cls} />;
-          })}
+          <g ref={gRef} transform={`translate(${view.x} ${view.y}) scale(${view.z})`}>
+          {/* edges — geometry is precomputed; only the lit/half class depends on
+              ownership, so this whole layer is memoized against the owned set */}
+          <TreeEdges owned={owned} />
           {/* nodes */}
           {TREE_NODES.map((n) => {
             const isOwned = owned.has(n.id);

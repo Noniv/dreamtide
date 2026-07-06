@@ -1,6 +1,41 @@
 // Pooled particle system. Everything dreamlike in Dreamtide flows through here.
 const MAX = 3600;
 
+// ---------------------------------------------------------------- glow sprites
+// Radial-gradient glows are the hottest particle mode (lanterns, hits, casts).
+// Building a fresh createRadialGradient per particle per frame is expensive and
+// churns the GC. Instead we bake each colour's glow into a small offscreen
+// canvas once, then drawImage it — allocation-free and much cheaper to fill.
+const GLOW_RES = 64; // sprite is 64×64; drawn scaled to the particle's size
+const glowCache = new Map();
+
+function glowSprite(color, color2, mode) {
+  const key = mode + '|' + color + '|' + (color2 || '');
+  let c = glowCache.get(key);
+  if (c) return c;
+  c = (typeof document !== 'undefined')
+    ? document.createElement('canvas')
+    : { width: GLOW_RES, height: GLOW_RES, getContext: () => null };
+  c.width = c.height = GLOW_RES;
+  const g = c.getContext && c.getContext('2d');
+  if (g) {
+    const r = GLOW_RES / 2;
+    const grad = g.createRadialGradient(r, r, 0, r, r, r);
+    if (mode === 'smoke') {
+      grad.addColorStop(0, color);
+      grad.addColorStop(1, 'rgba(0,0,0,0)');
+    } else {
+      grad.addColorStop(0, color);
+      grad.addColorStop(0.55, color2 || color);
+      grad.addColorStop(1, 'rgba(0,0,0,0)');
+    }
+    g.fillStyle = grad;
+    g.fillRect(0, 0, GLOW_RES, GLOW_RES);
+  }
+  glowCache.set(key, c);
+  return c;
+}
+
 export class ParticleSystem {
   constructor() {
     this.pool = new Array(MAX);
@@ -95,14 +130,9 @@ export class ParticleSystem {
 
       switch (p.mode) {
         case 'glow': {
-          const g = ctx.createRadialGradient(x, y, 0, x, y, size);
-          g.addColorStop(0, p.color);
-          g.addColorStop(0.55, p.color2 || p.color);
-          g.addColorStop(1, 'rgba(0,0,0,0)');
-          ctx.fillStyle = g;
-          ctx.beginPath();
-          ctx.arc(x, y, size, 0, Math.PI * 2);
-          ctx.fill();
+          // cached sprite: gradient radius = size, so draw at size*2 across
+          const spr = glowSprite(p.color, p.color2, 'glow');
+          ctx.drawImage(spr, x - size, y - size, size * 2, size * 2);
           break;
         }
         case 'star': {
@@ -203,13 +233,8 @@ export class ParticleSystem {
         }
         case 'smoke': {
           ctx.globalAlpha = Math.min(0.5, t * 0.5);
-          const g2 = ctx.createRadialGradient(x, y, 0, x, y, size);
-          g2.addColorStop(0, p.color);
-          g2.addColorStop(1, 'rgba(0,0,0,0)');
-          ctx.fillStyle = g2;
-          ctx.beginPath();
-          ctx.arc(x, y, size, 0, Math.PI * 2);
-          ctx.fill();
+          const spr = glowSprite(p.color, null, 'smoke');
+          ctx.drawImage(spr, x - size, y - size, size * 2, size * 2);
           break;
         }
       }
