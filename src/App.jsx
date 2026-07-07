@@ -218,6 +218,19 @@ function LevelUp({ choices, level, banishes, rerolls, showBanish, showReroll, on
   const [rolling, setRolling] = useState(false);
   const [deal, setDeal] = useState(0); // bumps to remount the hand after a reroll
   const busy = banishing != null || rolling;
+  // one pick per hand: picking a card can immediately deal the next queued
+  // level-up (same component, new choices). A stray double-click in that window
+  // would otherwise apply two upgrades + play two sounds — so lock until the
+  // hand actually changes. The ref resets whenever a new hand arrives.
+  const picked = useRef(false);
+  const handSig = `${level}:${choices.map((c) => `${c.kind}:${c.id}`).join(',')}`;
+  const lastSig = useRef(handSig);
+  if (handSig !== lastSig.current) { lastSig.current = handSig; picked.current = false; }
+  const pick = (c) => {
+    if (picked.current || busy) return;
+    picked.current = true;
+    onPick(c);
+  };
   const doBanish = (c, i) => {
     if (busy) return;
     setBanishing(i);
@@ -244,7 +257,7 @@ function LevelUp({ choices, level, banishes, rerolls, showBanish, showReroll, on
               <button
                 className={`card ${isEvolve ? 'evolve' : isSpell ? 'spell' : 'boon'}`}
                 style={isSpell ? { '--c': def.color, '--c2': def.color2 } : { '--c': '#ffd27a', '--c2': '#fff2cc' }}
-                onClick={() => onPick(c)}
+                onClick={() => pick(c)}
               >
                 <div className="card-glyph">{def.icon}</div>
                 <div className="card-name">{isEvolve ? EVOLVE[c.id].name : def.name}</div>

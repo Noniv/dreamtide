@@ -1,5 +1,20 @@
 // Pooled particle system. Everything dreamlike in Dreamtide flows through here.
 const MAX = 3600;
+// Adaptive emission budget: below SOFT every spawn is honoured (visuals are
+// unchanged at normal load). As the live count climbs past SOFT, an increasing
+// share of *new* cosmetic particles are dropped — under heavy combat the eye
+// can't resolve individual motes among a thousand overlapping glows, so thinning
+// them is invisible but reclaims the render time (particles dominate the frame).
+// The live-particle count is the #1 frame cost (each is a drawImage +
+// lighter-blend fill). Chrome profiling showed ~1600 sustained → ~811ms of
+// drawImage. Keep the effective count roughly half that: honour every spawn
+// below SOFT, then drop new cosmetic particles increasingly past it so the live
+// count self-limits near ~700-800 even under heavy combat (invisible thinning
+// among overlapping glows, big drop in draw calls + fill-rate).
+const SOFT = 500;
+// a throwaway particle handed back for dropped spawns so callers that tweak the
+// return value keep working without polluting the live pool
+const SINK = { alive: false };
 
 // ---------------------------------------------------------------- glow sprites
 // Radial-gradient glows are the hottest particle mode (lanterns, hits, casts).
@@ -38,25 +53,33 @@ function glowSprite(color, color2, mode) {
 
 export class ParticleSystem {
   constructor() {
+    // Pre-allocate every particle object once (no per-spawn GC). `pool` holds
+    // the live particles packed into [0, count); dead ones are swap-removed, so
+    // update()/draw() only ever walk the live prefix instead of all MAX slots.
     this.pool = new Array(MAX);
     for (let i = 0; i < MAX; i++) this.pool[i] = { alive: false };
-    this.cursor = 0;
+    this.count = 0;         // number of live particles, packed at the front
+    this.overwrite = 0;     // round-robin cursor for the saturated case
     this.aliveCount = 0;
   }
 
   spawn(opts) {
-    // scan for a free slot; if saturated, overwrite oldest-ish (cursor order)
-    let p = null;
-    for (let n = 0; n < 8; n++) {
-      this.cursor = (this.cursor + 1) % MAX;
-      if (!this.pool[this.cursor].alive) {
-        p = this.pool[this.cursor];
-        break;
-      }
+    // adaptive throttle: once the pool is busy, probabilistically drop new
+    // cosmetic particles. `keep` opts-out (rare, important one-offs).
+    if (this.count > SOFT && !opts.keep) {
+      // acceptance falls off steeply within ~400 particles past SOFT, so the
+      // live count self-limits near ~750 even under a heavy spawn rate
+      const over = (this.count - SOFT) / 400;
+      if (Math.random() < Math.min(0.985, over * (1.2 + over))) { SINK.alive = false; return SINK; }
     }
-    if (!p) {
-      this.cursor = (this.cursor + 1) % MAX;
-      p = this.pool[this.cursor];
+    let p;
+    if (this.count < MAX) {
+      // take the next free slot at the end of the live prefix
+      p = this.pool[this.count++];
+    } else {
+      // saturated: overwrite an existing live particle, round-robin
+      p = this.pool[this.overwrite];
+      this.overwrite = (this.overwrite + 1) % MAX;
     }
     p.alive = true;
     p.x = opts.x;
@@ -87,16 +110,21 @@ export class ParticleSystem {
   }
 
   update(dt) {
-    let count = 0;
-    for (let i = 0; i < MAX; i++) {
+    // walk only the live prefix; when a particle dies, swap the last live one
+    // into its place and shrink the count (order isn't significant for drawing)
+    let i = 0;
+    while (i < this.count) {
       const p = this.pool[i];
-      if (!p.alive) continue;
       p.life -= dt;
       if (p.life <= 0) {
         p.alive = false;
-        continue;
+        const last = --this.count;
+        if (i !== last) {
+          this.pool[i] = this.pool[last];
+          this.pool[last] = p;
+        }
+        continue; // re-check the swapped-in particle at this index
       }
-      count++;
       p.vx += p.ax * dt;
       p.vy += p.ay * dt;
       if (p.drag !== 1) {
@@ -110,23 +138,29 @@ export class ParticleSystem {
         p.x += Math.sin(p.seed + p.life * p.wobbleF * 6) * p.wobble * dt * 60;
       }
       p.rot += p.rotV * dt;
+      i++;
     }
-    this.aliveCount = count;
+    this.aliveCount = this.count;
   }
 
   draw(ctx, cam) {
     ctx.save();
-    for (let i = 0; i < MAX; i++) {
+    let curOp = 'source-over'; ctx.globalCompositeOperation = curOp;
+    for (let i = 0; i < this.count; i++) {
       const p = this.pool[i];
-      if (!p.alive) continue;
       const t = p.life / p.maxLife; // 1 -> 0
       const x = p.x - cam.x;
       const y = p.y - cam.y;
       if (x < -80 || y < -80 || x > cam.w + 80 || y > cam.h + 80) continue;
       const size = p.endSize + (p.size - p.endSize) * t;
+      // skip particles too small to matter — a sub-1.2px glow costs a full
+      // drawImage for effectively nothing on screen
+      if (size < 1.2) continue;
       const alpha = t < 0.35 ? t / 0.35 : 1;
       ctx.globalAlpha = Math.min(1, alpha);
-      ctx.globalCompositeOperation = p.mode === 'smoke' ? 'source-over' : 'lighter';
+      // only touch the composite op when it actually changes (most are 'lighter')
+      const op = p.mode === 'smoke' ? 'source-over' : 'lighter';
+      if (op !== curOp) { ctx.globalCompositeOperation = op; curOp = op; }
 
       switch (p.mode) {
         case 'glow': {

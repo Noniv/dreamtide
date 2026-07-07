@@ -8,6 +8,70 @@ const rand = (a, b) => a + Math.random() * (b - a);
 const pick = (arr) => arr[(Math.random() * arr.length) | 0];
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const dist2 = (ax, ay, bx, by) => (ax - bx) ** 2 + (ay - by) ** 2;
+const fmtClock = (t) => `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, '0')}`;
+
+// Cache for centered radial gradients (origin 0,0) reused across frames. Enemy
+// auras rebuilt a fresh createRadialGradient every enemy every frame; because
+// they're all drawn in the entity's local space (after translate to its
+// centre), one gradient object per unique (radius+stops) signature is valid for
+// every enemy forever — pixel-identical, but allocation-free. Keyed by a string
+// signature; the CanvasGradient is tied to the one game ctx.
+const _gradCache = new Map();
+function centeredRadial(ctx, r, stops) {
+  // stops: [[offset, color], ...]. Radius is rounded to the nearest pixel for
+  // the key + construction so continuously-scaled callers don't bloat the cache
+  // (a sub-pixel radius change in a soft glow is invisible).
+  r = Math.max(1, Math.round(r));
+  let key = r + '|';
+  for (let i = 0; i < stops.length; i++) key += stops[i][0] + ':' + stops[i][1] + ';';
+  let g = _gradCache.get(key);
+  if (!g) {
+    g = ctx.createRadialGradient(0, 0, 0, 0, 0, r);
+    for (const [o, c] of stops) g.addColorStop(o, c);
+    _gradCache.set(key, g);
+  }
+  return g;
+}
+
+// ---------------------------------------------------------------- spatial grid
+// A coarse uniform grid over the enemies, rebuilt once per frame. It turns the
+// many "scan every enemy within radius R" queries (lantern/rift/nebula ticks,
+// spell targeting, novae…) from O(enemies) each into O(enemies in the nearby
+// cells) — the dominant win once the endgame swarm gets large.
+const GRID_CELL = 130; // px; a touch larger than the biggest common enemy+aoe overlap
+class SpatialGrid {
+  constructor() { this.cells = new Map(); this.cell = GRID_CELL; }
+  _key(cx, cy) { return cx * 100000 + cy; }
+  rebuild(items) {
+    this.cells.clear();
+    const c = this.cell;
+    for (let i = 0; i < items.length; i++) {
+      const e = items[i];
+      if (e.dead) continue;
+      const k = this._key(Math.floor(e.x / c), Math.floor(e.y / c));
+      let bucket = this.cells.get(k);
+      if (!bucket) { bucket = []; this.cells.set(k, bucket); }
+      bucket.push(e);
+    }
+  }
+  // invoke fn(e) for every item whose cell overlaps the circle's bounding box.
+  // fn still does the precise distance test — the grid just prunes far cells.
+  queryCircle(x, y, r, fn) {
+    const c = this.cell;
+    const minX = Math.floor((x - r) / c), maxX = Math.floor((x + r) / c);
+    const minY = Math.floor((y - r) / c), maxY = Math.floor((y + r) / c);
+    for (let cx = minX; cx <= maxX; cx++) {
+      for (let cy = minY; cy <= maxY; cy++) {
+        const bucket = this.cells.get(this._key(cx, cy));
+        if (!bucket) continue;
+        for (let i = 0; i < bucket.length; i++) {
+          const e = bucket[i];
+          if (!e.dead) fn(e);
+        }
+      }
+    }
+  }
+}
 
 // ---------------------------------------------------------------- enemy types
 const ENEMY_TYPES = {
@@ -69,6 +133,7 @@ export class Engine {
     this.ctx = canvas.getContext('2d');
     this.hooks = hooks; // { onHud, onLevelUp, onGameOver }
     this.particles = new ParticleSystem();
+    this.grid = new SpatialGrid(); // enemy spatial index, rebuilt each frame
     this.keys = {};
     this.running = false;
     this.paused = false;
@@ -302,7 +367,7 @@ export class Engine {
   // -------------------------------------------------------------- level ups
   gainXp(n) {
     const p = this.player;
-    p.xp += n * (1 + (this.meta.xp || 0) / 100);
+    p.xp += n * (1 + (this.meta.xp || 0) / 100) * this.baneXpMul();
     // a single gem can cross several thresholds at once (merged dreamshards,
     // gem showers). Queue one choice per level and hand them out one at a
     // time — otherwise every level but the last would be silently skipped.
@@ -430,6 +495,9 @@ export class Engine {
   }
 
   chooseUpgrade(choice) {
+    // guard against a duplicate pick (e.g. a double-click landing before the UI
+    // swaps hands): a choice is only valid while a level-up is actually on screen
+    if (!this._levelUpActive) return false;
     if (choice.kind === 'spell' && choice.mastery) {
       const s = this.player.spells.find((x) => x.id === choice.id);
       if (s) s.mastery = (s.mastery || 0) + 1;
@@ -499,6 +567,19 @@ export class Engine {
     return Math.max(0, (T - 420) / 60); // 0 at 7:00, +1 each further minute
   }
 
+  // The Dark Bargain adds enemies (a higher floor, faster spawns) which would
+  // otherwise mean *more* XP and therefore more power — the opposite of what a
+  // curse should do. Damp per-kill XP to roughly cancel that extra throughput,
+  // so taking the bargain makes the dream harder without secretly feeding you.
+  baneXpMul() {
+    const m = this.meta;
+    const floor = m.baneFloor || 0;        // extra always-alive enemies
+    const rate = (m.baneRate || 0) / 100;  // faster spawns (fraction)
+    // ~2% less XP per extra floor enemy + counter the faster spawn rate
+    const mul = 1 / (1 + floor * 0.02 + rate * 0.6);
+    return Math.max(0.5, mul);
+  }
+
   difficulty() {
     const w = this.currentWave();
     const m = this.meta;
@@ -526,7 +607,11 @@ export class Engine {
     const def = ENEMY_TYPES[typeId] || ENEMY_TYPES.wisp;
     const d = this.difficulty();
     const ang = Math.random() * TAU;
-    let R = Math.max(this.cam.w, this.cam.h) * 0.62 + 60;
+    // bosses spawn just past the nearer screen edge so they engage promptly
+    // rather than trekking in from a far corner of a wide display
+    let R = boss
+      ? Math.min(this.cam.w, this.cam.h) * 0.5 + 80
+      : Math.max(this.cam.w, this.cam.h) * 0.62 + 60;
     // deep-endgame ambush: past the ramp, a growing share of the tide claws its
     // way in *close* — just outside melee — so a high-DPS player can no longer
     // mow everything down on the approach. This is the pressure that finally
@@ -545,7 +630,10 @@ export class Engine {
       speed: def.speed * d.spdMul * (elite ? 1.12 : 1) * (boss ? 0.75 : 1),
       dmg: def.dmg * d.dmgMul * (elite ? 1.5 : 1) * (boss ? 1.6 : 1),
       radius: def.radius * (elite ? 1.55 : 1) * (boss ? 3.4 : 1),
-      xp: Math.max(1, Math.round(def.xp * (1 + (d.hpMul - 1) * 0.3))) * (elite ? 6 : 1),
+      // XP tracks difficulty, but the endgame's runaway HP must NOT make enemies
+      // into XP piñatas — cap the HP→XP coupling so leveling slows as it should
+      // when the dream turns brutal (a fresh level costs far more than a kill gives).
+      xp: Math.max(1, Math.round(def.xp * (1 + Math.min(2.2, (d.hpMul - 1) * 0.3)) / (1 + d.esc * 0.12))) * (elite ? 6 : 1),
       color: def.color, elite,
       slow: 0, slowT: 0, hitFlash: 0, animT: Math.random() * 10, seed: Math.random() * 1000,
       knbx: 0, knby: 0,
@@ -1133,7 +1221,18 @@ export class Engine {
     e.hp -= dmg;
     e.hitFlash = 0.12;
     audio.hit();
-    this.texts.push({ x: e.x + rand(-8, 8), y: e.y - e.radius - 6, str: String(Math.round(dmg)) + (crit ? '!' : ''), color: crit ? '#ffd27a' : color, life: crit ? 0.85 : 0.65, vy: -55, size: (e.boss ? 18 : 13) + (crit ? 4 : 0) });
+    // Floating damage numbers, throttled per-enemy: rapid DoT ticks (lantern,
+    // nebula, rift…) would otherwise spawn a firehose of overlapping text —
+    // hundreds alive at once, each two fillText calls. Coalesce them: one number
+    // per enemy per ~0.22s (crits and bosses always show). This keeps the numbers
+    // readable *and* stops `texts` from dominating the frame late-game.
+    if (crit || e.boss || (e._dmgTextT || 0) <= this.t) {
+      e._dmgTextT = this.t + 0.28;
+      // hard cap on live numbers (crits/bosses bypass the cap so they always read)
+      if (this.texts.length < 90 || crit || e.boss) {
+        this.texts.push({ x: e.x + rand(-8, 8), y: e.y - e.radius - 6, str: String(Math.round(dmg)) + (crit ? '!' : ''), color: crit ? '#ffd27a' : color, life: crit ? 0.85 : 0.55, vy: -55, size: (e.boss ? 18 : 13) + (crit ? 4 : 0) });
+      }
+    }
     if (e.hp <= 0) this.killEnemy(e);
   }
 
@@ -1357,7 +1456,14 @@ export class Engine {
         o.x -= ux * push; o.y -= uy * push;
       }
     }
-    this.enemies = this.enemies.filter((e) => !e.dead && dist2(e.x, e.y, p.x, p.y) < 2600 * 2600);
+    // cull dead enemies and ones that drift far off-screen — but never a boss:
+    // a boss is slow, and a kiting player could otherwise pull it past the cull
+    // radius and make it silently vanish right after "THE DEVOURER STIRS".
+    this.enemies = this.enemies.filter((e) => !e.dead && (e.boss || dist2(e.x, e.y, p.x, p.y) < 2600 * 2600));
+
+    // index the (now settled) enemy positions so the AoE/zone/beam passes below
+    // can query only nearby enemies instead of scanning the whole swarm
+    this.grid.rebuild(this.enemies);
 
     // boss projectiles
     for (const bp of this.bossProjectiles) {
@@ -1440,10 +1546,10 @@ export class Engine {
           this.explode(pr.tx, pr.ty, pr.radius, pr.dmg, { ring: '#ffb3f2', core: '#ffffff', sparks: ['#ffb3f2', '#c48cff', '#8a7bff'], text: '#ffc9f5' });
           // Meteoric Mass: the impact leaves survivors reeling
           if (pr.stun) {
-            for (const e of this.enemies) {
-              if (e.dead || e.boss) continue;
+            this.grid.queryCircle(pr.tx, pr.ty, pr.radius + 60, (e) => {
+              if (e.boss) return;
               if (dist2(pr.tx, pr.ty, e.x, e.y) < (pr.radius + e.radius) ** 2) { e.slow = Math.max(e.slow, 0.9); e.slowT = Math.max(e.slowT, 0.7); }
-            }
+            });
           }
           if (pr.burn) this.zones.push({ kind: 'scorch', x: pr.tx, y: pr.ty, r: pr.radius * 0.75, life: 2.5, maxLife: 2.5, dps: pr.burn.dps, tick: 0, c1: pr.burn.c1, c2: pr.burn.c2, seed: rand(0, TAU) });
         } else pr.life = 1;
@@ -1452,15 +1558,15 @@ export class Engine {
         pr.x += pr.vx * dt;
         pr.y += pr.vy * dt;
         if (Math.random() < 0.7) this.particles.spawn({ x: pr.x, y: pr.y, vx: rand(-12, 12), vy: rand(-12, 12), life: 0.3, size: rand(3, 6), endSize: 0.5, color: '#8a5cd9', color2: '#20123d', mode: 'smoke' });
-        for (const e of this.enemies) {
-          if (e.dead || pr.hit.has(e)) continue;
+        this.grid.queryCircle(pr.x, pr.y, pr.r + 45, (e) => {
+          if (pr.hit.has(e)) return;
           if (dist2(pr.x, pr.y, e.x, e.y) < (e.radius + pr.r) ** 2) {
             pr.hit.add(e);
             this.damageEnemy(e, pr.dmg, '#c9a4ff');
             if (pr.chill && !e.boss) { e.slow = Math.max(e.slow, 0.35); e.slowT = Math.max(e.slowT, 1); }
             for (let i = 0; i < 6; i++) this.particles.spawn({ x: e.x, y: e.y, vx: rand(-130, 130), vy: rand(-130, 130), life: rand(0.2, 0.45), size: rand(2, 4), color: '#8a5cd9', mode: 'glow', drag: 0.86 });
           }
-        }
+        });
       } else if (pr.kind === 'glaive') {
         pr.life -= dt;
         pr.spin += dt * 14;
@@ -1483,15 +1589,14 @@ export class Engine {
         }
         // crystalline shard wake — distinct from arcane's soft glow-orbs
         if (Math.random() < 0.85) this.particles.spawn({ x: pr.x + rand(-3, 3), y: pr.y + rand(-3, 3), vx: rand(-25, 25), vy: rand(-25, 25), life: rand(0.3, 0.6), size: rand(2.5, 5), endSize: 0.5, color: '#e8f6ff', color2: '#9fd8ff', mode: 'shard', rotV: rand(-10, 10), drag: 0.93 });
-        for (const e of this.enemies) {
-          if (e.dead) continue;
-          if ((pr.hitCd[e.seed] || 0) > this.t) continue;
+        this.grid.queryCircle(pr.x, pr.y, pr.r + 45, (e) => {
+          if ((pr.hitCd[e.seed] || 0) > this.t) return;
           if (dist2(pr.x, pr.y, e.x, e.y) < (e.radius + pr.r) ** 2) {
             pr.hitCd[e.seed] = this.t + (pr.hitInt || 0.45);
             this.damageEnemy(e, pr.dmg, '#bfe4ff');
             for (let i = 0; i < 5; i++) this.particles.spawn({ x: e.x, y: e.y, vx: rand(-120, 120), vy: rand(-120, 120), life: rand(0.2, 0.4), size: rand(2, 4), color: '#bfe4ff', mode: 'star', rotV: rand(-6, 6), drag: 0.88 });
           }
-        }
+        });
       }
     }
     this.projectiles = this.projectiles.filter((pr) => pr.life > 0);
@@ -1503,8 +1608,8 @@ export class Engine {
       if (z.kind === 'frostwave') {
         const f = 1 - z.life / z.maxLife;
         z.r = 10 + (z.maxR - 10) * f;
-        for (const e of this.enemies) {
-          if (e.dead || z.hit.has(e)) continue;
+        this.grid.queryCircle(z.x, z.y, z.r, (e) => {
+          if (z.hit.has(e)) return;
           if (dist2(z.x, z.y, e.x, e.y) < z.r * z.r) {
             z.hit.add(e);
             this.damageEnemy(e, z.dmg, '#bff1ff');
@@ -1518,7 +1623,7 @@ export class Engine {
             }
             for (let i = 0; i < 6; i++) this.particles.spawn({ x: e.x, y: e.y, vx: rand(-60, 60), vy: rand(-90, -20), life: rand(0.4, 0.8), size: rand(3, 6), color: '#bff1ff', mode: 'shard', rotV: rand(-4, 4), drag: 0.93 });
           }
-        }
+        });
       } else if (z.kind === 'rift') {
         z.spin += dt * 3.2;
         z.tick -= dt;
@@ -1534,8 +1639,8 @@ export class Engine {
           const px = z.x + Math.cos(a) * R, py = z.y + Math.sin(a) * R;
           this.particles.spawn({ x: px, y: py, vx: (z.x - px) * 1.6 + -Math.sin(a) * 90, vy: (z.y - py) * 1.6 + Math.cos(a) * 90, life: rand(0.4, 0.8), size: rand(2, 5), color: Math.random() < 0.5 ? '#9a5cff' : '#ff9ad5', mode: 'glow', drag: 0.97 });
         }
-        for (const e of this.enemies) {
-          if (e.dead || (e.boss && !z.bossPull)) continue;
+        this.grid.queryCircle(z.x, z.y, z.r * 1.6, (e) => {
+          if (e.boss && !z.bossPull) return;
           const dd = dist2(z.x, z.y, e.x, e.y);
           if (dd < (z.r * 1.6) ** 2 && dd > 4) {
             const D = Math.sqrt(dd);
@@ -1543,13 +1648,12 @@ export class Engine {
             e.x += ((z.x - e.x) / D) * pull * dt;
             e.y += ((z.y - e.y) / D) * pull * dt;
           }
-        }
+        });
         if (z.tick <= 0) {
           z.tick = 0.25;
-          for (const e of this.enemies) {
-            if (e.dead) continue;
+          this.grid.queryCircle(z.x, z.y, z.r, (e) => {
             if (dist2(z.x, z.y, e.x, e.y) < z.r * z.r) this.damageEnemy(e, z.dps * 0.25, '#c9a4ff');
-          }
+          });
         }
       } else if (z.kind === 'nebula') {
         if (z.evolved) {
@@ -1573,8 +1677,7 @@ export class Engine {
         }
         if (z.tick <= 0) {
           z.tick = 0.3;
-          for (const e of this.enemies) {
-            if (e.dead) continue;
+          this.grid.queryCircle(z.x, z.y, z.r, (e) => {
             const dd = dist2(z.x, z.y, e.x, e.y);
             if (dd < z.r * z.r) {
               // Newborn Heart: the dense heart of the cloud burns double
@@ -1583,7 +1686,7 @@ export class Engine {
               // Whispering Mist: the cloud clings to those inside
               if (z.slowIn && !e.boss) { e.slow = Math.max(e.slow, z.slowIn / 100); e.slowT = Math.max(e.slowT, 0.5); }
             }
-          }
+          });
         }
       } else if (z.kind === 'sigil') {
         if (z.life <= 0) {
@@ -1595,13 +1698,12 @@ export class Engine {
             const a = rand(0, TAU);
             this.particles.spawn({ x: z.x, y: z.y, vx: Math.cos(a) * rand(60, 320), vy: Math.sin(a) * rand(60, 320), life: rand(0.3, 0.8), size: rand(2, 6), color: pick(['#ffd27a', '#b48cff', '#fff2cc']), mode: 'star', rotV: rand(-6, 6), drag: 0.88 });
           }
-          for (const e of this.enemies) {
-            if (e.dead) continue;
+          this.grid.queryCircle(z.x, z.y, z.r + 60, (e) => {
             if (dist2(z.x, z.y, e.x, e.y) < (z.r + e.radius) ** 2) {
               this.damageEnemy(e, z.dmg, '#ffe9bd');
               if (!e.boss) { e.slow = 0.92; e.slowT = z.sleepDur; }
             }
-          }
+          });
           // The Great Seal sounds twice
           if (z.echo && !z.echoed) { z.echoed = true; z.life = 0.9; }
         }
@@ -1613,16 +1715,15 @@ export class Engine {
         }
         if (z.tick <= 0) {
           z.tick = 0.3;
-          for (const e of this.enemies) {
-            if (e.dead) continue;
+          this.grid.queryCircle(z.x, z.y, z.r + 60, (e) => {
             if (dist2(z.x, z.y, e.x, e.y) < (z.r + e.radius) ** 2) this.damageEnemy(e, z.dps * 0.3, z.c2);
-          }
+          });
         }
       } else if (z.kind === 'novawave') {
         const f = 1 - z.life / z.maxLife;
         z.r = 10 + (z.maxR - 10) * f;
-        for (const e of this.enemies) {
-          if (e.dead || z.hit.has(e)) continue;
+        this.grid.queryCircle(z.x, z.y, z.r, (e) => {
+          if (z.hit.has(e)) return;
           if (dist2(z.x, z.y, e.x, e.y) < z.r * z.r) {
             z.hit.add(e);
             this.damageEnemy(e, z.dmg, '#ffbfe4');
@@ -1634,17 +1735,16 @@ export class Engine {
               if (z.slowGlow) { e.slow = Math.max(e.slow, 0.35); e.slowT = Math.max(e.slowT, 1.2); }
             }
           }
-        }
+        });
       } else if (z.kind === 'lantern') {
         z.ph += dt * 4;
         z.tick -= dt;
         if (z.tick <= 0) {
           z.tick = z.int;
           let struck = false;
-          for (const e of this.enemies) {
-            if (e.dead) continue;
+          this.grid.queryCircle(z.x, z.y, z.r + 60, (e) => {
             if (dist2(z.x, z.y, e.x, e.y) < (z.r + e.radius) ** 2) { this.damageEnemy(e, z.dmg, '#a8ffe8'); struck = true; }
-          }
+          });
           // a soft cold-fire swell where the lantern pulses — a filled glow
           // that blooms and fades, gentler than a hard expanding ring
           this.particles.spawn({ x: z.x, y: z.y, life: 0.5, size: z.r * 0.62, endSize: z.r * 0.9, color: 'rgba(168,255,232,0.5)', color2: 'rgba(74,217,196,0.12)', mode: 'glow', drag: 1 });
@@ -1668,19 +1768,21 @@ export class Engine {
       b.life -= dt;
       if (b.sweep) b.a += b.sweep * dt;
       const ca = Math.cos(b.a), sa = Math.sin(b.a);
-      for (const e of this.enemies) {
-        if (e.dead || b.hit.has(e)) continue;
+      // query a circle enclosing the whole lance, then do the precise line test
+      const mx = b.x + ca * b.len * 0.5, my = b.y + sa * b.len * 0.5;
+      this.grid.queryCircle(mx, my, b.len * 0.5 + b.w * 0.5 + 40, (e) => {
+        if (b.hit.has(e)) return;
         // point-line distance within beam length
         const ex = e.x - b.x, ey = e.y - b.y;
         const proj = ex * ca + ey * sa;
-        if (proj < 0 || proj > b.len) continue;
+        if (proj < 0 || proj > b.len) return;
         const perp = Math.abs(-ex * sa + ey * ca);
         if (perp < b.w * 0.5 + e.radius) {
           b.hit.add(e);
           this.damageEnemy(e, b.dmg, '#fff3b8');
           for (let i = 0; i < 8; i++) this.particles.spawn({ x: e.x, y: e.y, vx: rand(-140, 140), vy: rand(-140, 140), life: rand(0.25, 0.55), size: rand(2, 5), color: '#fff3b8', mode: 'star', rotV: rand(-8, 8), drag: 0.88 });
         }
-      }
+      });
       // moondust along the lance
       for (let i = 0; i < 4; i++) {
         const dPos = rand(0, b.len);
@@ -1933,7 +2035,6 @@ export class Engine {
 
     // projectiles
     for (const pr of this.projectiles) this.drawProjectile(ctx, cam, pr);
-
     // boss projectiles
     for (const bp of this.bossProjectiles) this.drawBossProjectile(ctx, cam, bp);
 
@@ -1944,16 +2045,20 @@ export class Engine {
     // particles above all entities
     this.particles.draw(ctx, cam);
 
-    // damage texts
+    // damage texts — a cheap dark backing instead of a per-glyph shadowBlur
+    // (blur is costly and there can be dozens of numbers up at once). The font
+    // string is only re-set when the size actually changes.
     ctx.save();
     ctx.textAlign = 'center';
+    let curFont = 0;
     for (const t of this.texts) {
       ctx.globalAlpha = Math.min(1, t.life * 2);
-      ctx.font = `700 ${t.size}px Cinzel, serif`;
+      if (t.size !== curFont) { ctx.font = `700 ${t.size}px Cinzel, serif`; curFont = t.size; }
+      const tx = t.x - cam.x, ty = t.y - cam.y;
+      ctx.fillStyle = 'rgba(6,4,16,0.6)';
+      ctx.fillText(t.str, tx + 1.2, ty + 1.2);
       ctx.fillStyle = t.color;
-      ctx.shadowColor = t.color;
-      ctx.shadowBlur = 8;
-      ctx.fillText(t.str, t.x - cam.x, t.y - cam.y);
+      ctx.fillText(t.str, tx, ty);
     }
     ctx.restore();
 
@@ -2395,11 +2500,7 @@ export class Engine {
       const a = Math.atan2(pr.vy, pr.vx);
       ctx.translate(x, y);
       ctx.rotate(a);
-      const g = ctx.createRadialGradient(0, 0, 0, 0, 0, 14);
-      g.addColorStop(0, '#ffffff');
-      g.addColorStop(0.4, '#b48cff');
-      g.addColorStop(1, 'rgba(0,0,0,0)');
-      ctx.fillStyle = g;
+      ctx.fillStyle = centeredRadial(ctx, 14, [[0, '#ffffff'], [0.4, '#b48cff'], [1, 'rgba(0,0,0,0)']]);
       ctx.beginPath();
       ctx.arc(0, 0, 14, 0, TAU);
       ctx.fill();
@@ -2450,11 +2551,7 @@ export class Engine {
       ctx.lineTo(4, 6);
       ctx.closePath();
       ctx.fill();
-      const g = ctx.createRadialGradient(0, 0, 0, 0, 0, 15);
-      g.addColorStop(0, '#ffffff');
-      g.addColorStop(0.4, '#ffb3f2');
-      g.addColorStop(1, 'rgba(0,0,0,0)');
-      ctx.fillStyle = g;
+      ctx.fillStyle = centeredRadial(ctx, 15, [[0, '#ffffff'], [0.4, '#ffb3f2'], [1, 'rgba(0,0,0,0)']]);
       ctx.beginPath();
       ctx.arc(0, 0, 15, 0, TAU);
       ctx.fill();
@@ -2462,10 +2559,7 @@ export class Engine {
       const a = Math.atan2(pr.vy, pr.vx);
       ctx.translate(x, y);
       ctx.rotate(a);
-      const g = ctx.createRadialGradient(0, 0, 0, 0, 0, 18);
-      g.addColorStop(0, 'rgba(138,92,217,0.85)');
-      g.addColorStop(1, 'rgba(32,18,61,0)');
-      ctx.fillStyle = g;
+      ctx.fillStyle = centeredRadial(ctx, 18, [[0, 'rgba(138,92,217,0.85)'], [1, 'rgba(32,18,61,0)']]);
       ctx.beginPath();
       ctx.arc(0, 0, 18, 0, TAU);
       ctx.fill();
@@ -2582,10 +2676,7 @@ export class Engine {
       ctx.translate(x, y);
       ctx.rotate(o.a * 2);
       ctx.globalCompositeOperation = 'lighter';
-      const g = ctx.createRadialGradient(0, 0, 0, 0, 0, 14);
-      g.addColorStop(0, 'rgba(125,255,176,0.8)');
-      g.addColorStop(1, 'rgba(0,0,0,0)');
-      ctx.fillStyle = g;
+      ctx.fillStyle = centeredRadial(ctx, 14, [[0, 'rgba(125,255,176,0.8)'], [1, 'rgba(0,0,0,0)']]);
       ctx.beginPath();
       ctx.arc(0, 0, 14, 0, TAU);
       ctx.fill();
@@ -2617,24 +2708,43 @@ export class Engine {
     if (x < -30 || y < -30 || x > cam.w + 30 || y > cam.h + 30) return;
     const a = Math.atan2(bp.vy, bp.vx);
     const s = bp.r / 6; // scale relative to the old 6px radius
+    const pulse = 0.85 + 0.15 * Math.sin(this.t * 12 + (bp.x + bp.y) * 0.05);
+    // a short hot streak behind the shot so a fast bullet is easy to track
+    // (flat stroke, no per-frame gradient allocation — keeps the frame cheap)
+    const sp = Math.hypot(bp.vx, bp.vy) || 1;
+    const tl = Math.min(26, sp * 0.045) * s;
+    if (tl > 4) {
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.globalAlpha = 0.5;
+      ctx.strokeStyle = '#ff5a64';
+      ctx.lineWidth = 3.2 * s;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(x - (bp.vx / sp) * tl, y - (bp.vy / sp) * tl);
+      ctx.lineTo(x, y);
+      ctx.stroke();
+      ctx.restore();
+    }
     ctx.save();
     ctx.translate(x, y);
-    ctx.rotate(a);
-    // hot red halo (small, so the dark body still silhouettes)
+    // bright, larger hot-red glow so incoming shots read clearly from a
+    // distance against the busy dreamscape (drawn unrotated so it stays round).
+    // gr is quantized so the cached radial gradient matches the filled arc.
     ctx.globalCompositeOperation = 'lighter';
-    const g = ctx.createRadialGradient(0, 0, 0, 0, 0, 14 * s);
-    g.addColorStop(0, 'rgba(255,60,70,0.55)');
-    g.addColorStop(1, 'rgba(0,0,0,0)');
-    ctx.fillStyle = g;
+    const gr = Math.round(22 * s * pulse);
+    ctx.fillStyle = centeredRadial(ctx, gr, [[0, 'rgba(255,120,120,0.95)'], [0.35, 'rgba(255,60,70,0.6)'], [1, 'rgba(0,0,0,0)']]);
     ctx.beginPath();
-    ctx.arc(0, 0, 14 * s, 0, TAU);
+    ctx.arc(0, 0, gr, 0, TAU);
     ctx.fill();
+    ctx.rotate(a);
     ctx.globalCompositeOperation = 'source-over';
-    // jagged dark dart body with a pale rim
+    // jagged dark dart body with a bright hot rim so the threat silhouette
+    // stays crisp and readable
     ctx.scale(s, s);
     ctx.fillStyle = '#1a0a14';
-    ctx.strokeStyle = 'rgba(255,190,200,0.9)';
-    ctx.lineWidth = 1.2;
+    ctx.strokeStyle = 'rgba(255,210,215,0.95)';
+    ctx.lineWidth = 1.6;
     ctx.beginPath();
     ctx.moveTo(11, 0);
     ctx.lineTo(2, -3);
@@ -2647,12 +2757,14 @@ export class Engine {
     ctx.closePath();
     ctx.fill();
     ctx.stroke();
-    // burning red core
-    ctx.fillStyle = '#ff2e44';
-    ctx.shadowColor = '#ff2e44';
-    ctx.shadowBlur = 8;
+    // bigger burning red core so the bullet's heart reads at a glance
+    ctx.fillStyle = '#ff5a6e';
     ctx.beginPath();
-    ctx.arc(0.5, 0, 2.4, 0, TAU);
+    ctx.arc(0.5, 0, 3.4, 0, TAU);
+    ctx.fill();
+    ctx.fillStyle = '#ffd6da';
+    ctx.beginPath();
+    ctx.arc(0.5, 0, 1.5, 0, TAU);
     ctx.fill();
     ctx.restore();
   }
@@ -2867,11 +2979,7 @@ export class Engine {
   drawWisp(ctx, e, tint) {
     const fl = Math.sin(e.animT * 9 + e.seed);
     ctx.globalCompositeOperation = 'lighter';
-    const g = ctx.createRadialGradient(0, 0, 0, 0, 0, 20);
-    g.addColorStop(0, tint || '#dffcff');
-    g.addColorStop(0.45, '#7ff5ff');
-    g.addColorStop(1, 'rgba(0,0,0,0)');
-    ctx.fillStyle = g;
+    ctx.fillStyle = centeredRadial(ctx, 20, [[0, tint || '#dffcff'], [0.45, '#7ff5ff'], [1, 'rgba(0,0,0,0)']]);
     ctx.beginPath();
     ctx.arc(0, 0, 20, 0, TAU);
     ctx.fill();
