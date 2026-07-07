@@ -1,5 +1,6 @@
 import { ParticleSystem } from './particles.js';
 import { GPUParticleRenderer } from './gpuParticles.js';
+import { Profiler } from './profiler.js';
 import { SPELLS, BOONS, EVOLVE } from './spells.js';
 import { audio } from './audio.js';
 import { dustForRun } from './meta.js';
@@ -41,17 +42,33 @@ function centeredRadial(ctx, r, stops) {
 // cells) — the dominant win once the endgame swarm gets large.
 const GRID_CELL = 130; // px; a touch larger than the biggest common enemy+aoe overlap
 class SpatialGrid {
-  constructor() { this.cells = new Map(); this.cell = GRID_CELL; }
+  constructor() {
+    this.cells = new Map();
+    this.cell = GRID_CELL;
+    // Pool of cell arrays reused across frames. rebuild() previously allocated a
+    // fresh [] per occupied cell every frame (dozens of arrays/frame under a
+    // heavy swarm — a measured GC source). Instead we keep the arrays, length=0
+    // them, and hand them back out, so a steady-state frame allocates nothing.
+    this._pool = [];
+    this._poolN = 0;
+  }
   _key(cx, cy) { return cx * 100000 + cy; }
   rebuild(items) {
     this.cells.clear();
+    this._poolN = 0; // reclaim all pooled buckets for reuse this frame
     const c = this.cell;
     for (let i = 0; i < items.length; i++) {
       const e = items[i];
       if (e.dead) continue;
       const k = this._key(Math.floor(e.x / c), Math.floor(e.y / c));
       let bucket = this.cells.get(k);
-      if (!bucket) { bucket = []; this.cells.set(k, bucket); }
+      if (!bucket) {
+        // reuse a pooled array if available, else grow the pool once
+        bucket = this._pool[this._poolN];
+        if (bucket) bucket.length = 0; else { bucket = []; this._pool[this._poolN] = bucket; }
+        this._poolN++;
+        this.cells.set(k, bucket);
+      }
       bucket.push(e);
     }
   }
@@ -149,6 +166,7 @@ export class Engine {
     this.octx = null;
     if (this.gpuParticles) this._makeOverlay(canvas);
     this.grid = new SpatialGrid(); // enemy spatial index, rebuilt each frame
+    this.profiler = new Profiler(); // dev perf capture, toggled with F
     this.keys = {};
     this.running = false;
     this.paused = false;
@@ -158,6 +176,9 @@ export class Engine {
     this.bindInput();
     this.resize();
     window.addEventListener('resize', () => this.resize());
+    // dev-only handle for profiling/automation (e.g. forcing heavy load to
+    // reproduce GC stutters). Harmless: exposes the live engine, nothing more.
+    if (typeof window !== 'undefined') window.__engine = this;
   }
 
   // Top 2D overlay canvas, stacked above the GPU particle layer. Holds the
@@ -296,6 +317,8 @@ export class Engine {
         this.paused = !this.paused;
         this.pushHud(true);
       }
+      // dev profiler: F starts/stops recording; stopping exports a JSON log
+      if (e.key === 'f' || e.key === 'F') this.profiler.toggle(this);
     });
     window.addEventListener('keyup', (e) => (this.keys[e.key.toLowerCase()] = false));
   }
@@ -308,8 +331,25 @@ export class Engine {
       let dt = (now - this.last) / 1000;
       this.last = now;
       dt = Math.min(dt, 0.05);
+      // snapshot live counts BEFORE this frame's spawns so the profiler can
+      // attribute per-frame spawn bursts (a prime stutter suspect)
+      const spawnBase = this.profiler.recording ? {
+        enemies: this.enemies.length,
+        projectiles: this.projectiles.length + this.bossProjectiles.length,
+        zones: this.zones.length,
+        particles: this.particles.count,
+      } : null;
+      this.profiler.frameBegin(now, spawnBase);
+      this.profiler.mark('update');
       if (!this.paused) this.update(dt);
       this.render();
+      const spawnEnd = spawnBase ? {
+        enemies: this.enemies.length,
+        projectiles: this.projectiles.length + this.bossProjectiles.length,
+        zones: this.zones.length,
+        particles: this.particles.count,
+      } : null;
+      this.profiler.frameEnd(performance.now(), spawnEnd);
       requestAnimationFrame(loop);
     };
     requestAnimationFrame(loop);
@@ -916,9 +956,24 @@ export class Engine {
     return { x: clamp(x, r.left, r.right), y: clamp(y, r.top, r.bottom) };
   }
 
+  // Enemies inside the view rect. Called several times per frame (once per spell
+  // in castSpells, etc). Each call used to .filter() a fresh array — a measured
+  // GC source. We memoise into a reused array, rebuilt at most once per frame
+  // (keyed on this.t, which advances once per update). Enemies don't move
+  // between these intra-frame calls, so the cache is valid.
   visibleEnemies() {
-    const { left, right, top, bottom } = this.viewRect(0);
-    return this.enemies.filter((e) => !e.dead && e.x >= left && e.x <= right && e.y >= top && e.y <= bottom);
+    if (this._visT === this.t && this._visCache) return this._visCache;
+    const arr = this._visCache || (this._visCache = []);
+    arr.length = 0;
+    const { x, y, w, h } = this.cam;
+    const left = x, right = x + w, top = y, bottom = y + h;
+    const en = this.enemies;
+    for (let i = 0; i < en.length; i++) {
+      const e = en[i];
+      if (!e.dead && e.x >= left && e.x <= right && e.y >= top && e.y <= bottom) arr.push(e);
+    }
+    this._visT = this.t;
+    return arr;
   }
 
   nearestEnemy(x, y, maxR = Infinity, exclude = null, preferBoss = false) {
@@ -2019,8 +2074,13 @@ export class Engine {
     const { w, h } = this.cam;
     const camX = this.cam.x;
     const camY = this.cam.y;
-    const cam = { x: camX, y: camY, w, h };
+    // reuse this.cam directly (same {x,y,w,h} shape) instead of allocating a
+    // fresh copy every frame — it's passed by reference to the draw methods,
+    // which only read from it
+    const cam = this.cam;
+    const prof = this.profiler;
 
+    prof.mark('background'); // sky + parallax stars + drifting motes
     // dreamscape sky
     const sky = ctx.createLinearGradient(0, 0, 0, h);
     sky.addColorStop(0, '#0b0a1e');
@@ -2064,6 +2124,7 @@ export class Engine {
     }
     ctx.restore();
 
+    prof.mark('zones/gems/pickups');
     // zones (under entities)
     for (const z of this.zones) this.drawZone(ctx, cam, z);
 
@@ -2073,24 +2134,29 @@ export class Engine {
     // fallen stars
     for (const s of this.pickups) this.drawPickup(ctx, cam, s);
 
+    prof.mark('enemies');
     // enemies
     for (const e of this.enemies) this.drawEnemy(ctx, cam, e);
 
+    prof.mark('player/orbitals');
     // player
     this.drawPlayer(ctx, cam);
 
     // orbitals
     this.drawOrbitals(ctx, cam);
 
+    prof.mark('projectiles');
     // projectiles
     for (const pr of this.projectiles) this.drawProjectile(ctx, cam, pr);
     // boss projectiles
     for (const bp of this.bossProjectiles) this.drawBossProjectile(ctx, cam, bp);
 
+    prof.mark('beams/bolts');
     // beams & bolts
     for (const b of this.beams) this.drawBeam(ctx, cam, b);
     for (const b of this.bolts) this.drawBolt(ctx, cam, b);
 
+    prof.mark('particles(GPU dispatch)');
     // particles above all entities. The fill-rate-heavy glow/smoke sprites are
     // batched on the GPU (a transparent WebGL2 canvas stacked on top of this
     // one, so they composite above all entities exactly as before); Canvas2D
@@ -2104,6 +2170,7 @@ export class Engine {
     // active they render to the top overlay canvas (octx); otherwise they render
     // to the same 2D canvas as everything else. Either way the visual order is
     // identical to the original single-canvas pipeline.
+    prof.mark('overlays');
     const octx = gpu && this.octx ? this.octx : ctx;
     if (octx !== ctx) octx.clearRect(0, 0, w, h);
 
@@ -2202,6 +2269,17 @@ export class Engine {
       octx.fillText('the dream begins…', w / 2, h / 2 - 90);
       octx.restore();
     }
+
+    // profiler bookkeeping: record live entity counts and draw the REC dot on
+    // the topmost 2D layer (overlay when GPU is active, else the main canvas)
+    prof.counts({
+      enemies: this.enemies.length,
+      projectiles: this.projectiles.length + this.bossProjectiles.length,
+      particles: this.particles.count,
+      zones: this.zones.length,
+      gems: this.gems.length,
+    });
+    prof.drawIndicator(octx, w);
   }
 
   drawPickup(ctx, cam, s) {
