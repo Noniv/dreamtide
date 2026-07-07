@@ -143,11 +143,15 @@ export class ParticleSystem {
     this.aliveCount = this.count;
   }
 
-  draw(ctx, cam) {
+  // `skipSprites` is set when a GPU renderer is drawing the sprite modes
+  // ('glow'/'smoke'). In that case Canvas2D only handles the vector modes, which
+  // are cheap and few, and the fill-rate-heavy glows are batched on the GPU.
+  draw(ctx, cam, skipSprites) {
     ctx.save();
     let curOp = 'source-over'; ctx.globalCompositeOperation = curOp;
     for (let i = 0; i < this.count; i++) {
       const p = this.pool[i];
+      if (skipSprites && (p.mode === 'glow' || p.mode === 'smoke')) continue;
       const t = p.life / p.maxLife; // 1 -> 0
       const x = p.x - cam.x;
       const y = p.y - cam.y;

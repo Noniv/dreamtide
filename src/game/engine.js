@@ -1,4 +1,5 @@
 import { ParticleSystem } from './particles.js';
+import { GPUParticleRenderer } from './gpuParticles.js';
 import { SPELLS, BOONS, EVOLVE } from './spells.js';
 import { audio } from './audio.js';
 import { dustForRun } from './meta.js';
@@ -133,6 +134,20 @@ export class Engine {
     this.ctx = canvas.getContext('2d');
     this.hooks = hooks; // { onHud, onLevelUp, onGameOver }
     this.particles = new ParticleSystem();
+    // GPU-accelerated glow/smoke particle layer (WebGL2). null on machines
+    // without WebGL2 — the render path then falls back to pure Canvas2D. This is
+    // the game's #1 documented frame cost, so it's the one workload we offload.
+    this.gpuParticles = GPUParticleRenderer.create(canvas);
+    // When the GPU particle layer is active it stacks ABOVE this 2D canvas, so
+    // the screen overlays that originally draw *after* particles (vignette,
+    // damage numbers, banner, flash, dream-in, edge arrows) must move to a thin
+    // 2D canvas stacked above the GPU layer to preserve the exact draw order:
+    //   world 2D (bottom) -> GPU particles (middle) -> overlay 2D (top).
+    // Without WebGL2 there's no GPU layer and everything stays on this one
+    // canvas in its original order (octx === ctx in render()).
+    this.overlay = null;
+    this.octx = null;
+    if (this.gpuParticles) this._makeOverlay(canvas);
     this.grid = new SpatialGrid(); // enemy spatial index, rebuilt each frame
     this.keys = {};
     this.running = false;
@@ -143,6 +158,25 @@ export class Engine {
     this.bindInput();
     this.resize();
     window.addEventListener('resize', () => this.resize());
+  }
+
+  // Top 2D overlay canvas, stacked above the GPU particle layer. Holds the
+  // screen-space overlays (vignette/text/banner/flash/dream-in/arrows) so they
+  // keep drawing on top of particles even though particles now live on their own
+  // GPU canvas. Only created when the GPU layer is active.
+  _makeOverlay(hostCanvas) {
+    if (typeof document === 'undefined' || !hostCanvas.parentNode) return;
+    const c = document.createElement('canvas');
+    c.className = 'game-canvas gpu-overlay-layer';
+    c.style.position = 'absolute';
+    c.style.inset = '0';
+    c.style.pointerEvents = 'none';
+    // insert after the GPU canvas (which was inserted right after the host), so
+    // it ends up on top of both
+    const anchor = (this.gpuParticles && this.gpuParticles.glCanvas) || hostCanvas;
+    anchor.parentNode.insertBefore(c, anchor.nextSibling);
+    this.overlay = c;
+    this.octx = c.getContext('2d');
   }
 
   reset() {
@@ -244,6 +278,14 @@ export class Engine {
     this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     this.cam.w = window.innerWidth;
     this.cam.h = window.innerHeight;
+    if (this.gpuParticles) this.gpuParticles.resize(window.innerWidth, window.innerHeight, dpr);
+    if (this.overlay) {
+      this.overlay.width = window.innerWidth * dpr;
+      this.overlay.height = window.innerHeight * dpr;
+      this.overlay.style.width = window.innerWidth + 'px';
+      this.overlay.style.height = window.innerHeight + 'px';
+      this.octx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
   }
 
   bindInput() {
@@ -273,7 +315,14 @@ export class Engine {
     requestAnimationFrame(loop);
   }
 
-  stop() { this.running = false; }
+  stop() {
+    this.running = false;
+    // tear down the injected GPU/overlay canvases so a re-mounted engine doesn't
+    // leave orphaned layers stacked in the DOM
+    if (this.gpuParticles) { this.gpuParticles.dispose(); this.gpuParticles = null; }
+    if (this.overlay && this.overlay.parentNode) this.overlay.parentNode.removeChild(this.overlay);
+    this.overlay = null; this.octx = null;
+  }
 
   // -------------------------------------------------------------- boon math
   dmgMul() { return (1 + 0.12 * (this.player.boons.power || 0)) * (1 + 0.1 * (this.player._genericPower || 0)) * (1 + (this.meta.dmg || 0) / 100) * (this.surges.dmg > 0 ? 1.3 : 1); }
@@ -2042,32 +2091,45 @@ export class Engine {
     for (const b of this.beams) this.drawBeam(ctx, cam, b);
     for (const b of this.bolts) this.drawBolt(ctx, cam, b);
 
-    // particles above all entities
-    this.particles.draw(ctx, cam);
+    // particles above all entities. The fill-rate-heavy glow/smoke sprites are
+    // batched on the GPU (a transparent WebGL2 canvas stacked on top of this
+    // one, so they composite above all entities exactly as before); Canvas2D
+    // then draws only the cheap vector modes. Without WebGL2, gpuParticles is
+    // null and Canvas2D draws everything (full graceful fallback).
+    const gpu = this.gpuParticles;
+    this.particles.draw(ctx, cam, !!gpu);
+    if (gpu) gpu.draw(this.particles.pool, this.particles.count, cam);
+
+    // Screen overlays that must sit ON TOP of particles. With the GPU layer
+    // active they render to the top overlay canvas (octx); otherwise they render
+    // to the same 2D canvas as everything else. Either way the visual order is
+    // identical to the original single-canvas pipeline.
+    const octx = gpu && this.octx ? this.octx : ctx;
+    if (octx !== ctx) octx.clearRect(0, 0, w, h);
 
     // damage texts — a cheap dark backing instead of a per-glyph shadowBlur
     // (blur is costly and there can be dozens of numbers up at once). The font
     // string is only re-set when the size actually changes.
-    ctx.save();
-    ctx.textAlign = 'center';
+    octx.save();
+    octx.textAlign = 'center';
     let curFont = 0;
     for (const t of this.texts) {
-      ctx.globalAlpha = Math.min(1, t.life * 2);
-      if (t.size !== curFont) { ctx.font = `700 ${t.size}px Cinzel, serif`; curFont = t.size; }
+      octx.globalAlpha = Math.min(1, t.life * 2);
+      if (t.size !== curFont) { octx.font = `700 ${t.size}px Cinzel, serif`; curFont = t.size; }
       const tx = t.x - cam.x, ty = t.y - cam.y;
-      ctx.fillStyle = 'rgba(6,4,16,0.6)';
-      ctx.fillText(t.str, tx + 1.2, ty + 1.2);
-      ctx.fillStyle = t.color;
-      ctx.fillText(t.str, tx, ty);
+      octx.fillStyle = 'rgba(6,4,16,0.6)';
+      octx.fillText(t.str, tx + 1.2, ty + 1.2);
+      octx.fillStyle = t.color;
+      octx.fillText(t.str, tx, ty);
     }
-    ctx.restore();
+    octx.restore();
 
     // vignette
-    const vg = ctx.createRadialGradient(w / 2, h / 2, Math.min(w, h) * 0.35, w / 2, h / 2, Math.max(w, h) * 0.72);
+    const vg = octx.createRadialGradient(w / 2, h / 2, Math.min(w, h) * 0.35, w / 2, h / 2, Math.max(w, h) * 0.72);
     vg.addColorStop(0, 'rgba(0,0,0,0)');
     vg.addColorStop(1, 'rgba(5,3,18,0.55)');
-    ctx.fillStyle = vg;
-    ctx.fillRect(0, 0, w, h);
+    octx.fillStyle = vg;
+    octx.fillRect(0, 0, w, h);
 
     // edge arrows toward off-screen fallen stars
     for (const s of this.pickups) {
@@ -2075,70 +2137,70 @@ export class Engine {
       if (sx >= 0 && sx <= w && sy >= 0 && sy <= h) continue;
       const ax = clamp(sx, 46, w - 46), ay = clamp(sy, 46, h - 46);
       const ang = Math.atan2(sy - ay, sx - ax);
-      ctx.save();
-      ctx.translate(ax, ay);
-      ctx.rotate(ang);
-      ctx.globalAlpha = 0.55 + 0.3 * Math.sin(this.t * 5);
-      ctx.fillStyle = '#7ff5ff';
-      ctx.shadowColor = '#7ff5ff';
-      ctx.shadowBlur = 10;
-      ctx.beginPath();
-      ctx.moveTo(14, 0);
-      ctx.lineTo(-8, -8);
-      ctx.lineTo(-4, 0);
-      ctx.lineTo(-8, 8);
-      ctx.closePath();
-      ctx.fill();
-      ctx.restore();
+      octx.save();
+      octx.translate(ax, ay);
+      octx.rotate(ang);
+      octx.globalAlpha = 0.55 + 0.3 * Math.sin(this.t * 5);
+      octx.fillStyle = '#7ff5ff';
+      octx.shadowColor = '#7ff5ff';
+      octx.shadowBlur = 10;
+      octx.beginPath();
+      octx.moveTo(14, 0);
+      octx.lineTo(-8, -8);
+      octx.lineTo(-4, 0);
+      octx.lineTo(-8, 8);
+      octx.closePath();
+      octx.fill();
+      octx.restore();
     }
 
     // event banner
     if (this.banner) {
       const b = this.banner;
       const a = Math.min(1, b.life, (b.maxLife - b.life) * 3);
-      ctx.save();
-      ctx.globalAlpha = a;
-      ctx.textAlign = 'center';
-      ctx.font = `700 ${b.size || 24}px Cinzel, serif`;
-      ctx.fillStyle = b.color;
-      ctx.shadowColor = b.color;
-      ctx.shadowBlur = 18 + (b.size > 24 ? 14 : 0);
-      ctx.fillText(b.str, w / 2, 118 + ((b.size || 24) - 24) * 0.6);
-      ctx.restore();
+      octx.save();
+      octx.globalAlpha = a;
+      octx.textAlign = 'center';
+      octx.font = `700 ${b.size || 24}px Cinzel, serif`;
+      octx.fillStyle = b.color;
+      octx.shadowColor = b.color;
+      octx.shadowBlur = 18 + (b.size > 24 ? 14 : 0);
+      octx.fillText(b.str, w / 2, 118 + ((b.size || 24) - 24) * 0.6);
+      octx.restore();
     }
 
     if (this.flash) {
-      ctx.fillStyle = `rgba(${this.flash.color},${Math.max(0, this.flash.a)})`;
-      ctx.fillRect(0, 0, w, h);
+      octx.fillStyle = `rgba(${this.flash.color},${Math.max(0, this.flash.a)})`;
+      octx.fillRect(0, 0, w, h);
     }
 
     // dream-in: the world condenses out of pale moonlight when a run begins
     if (this.wake > 0) {
       const f = Math.pow(this.wake / 1.8, 1.35);
-      ctx.save();
-      const g = ctx.createRadialGradient(w / 2, h / 2, 0, w / 2, h / 2, Math.max(w, h) * 0.75);
+      octx.save();
+      const g = octx.createRadialGradient(w / 2, h / 2, 0, w / 2, h / 2, Math.max(w, h) * 0.75);
       g.addColorStop(0, `rgba(238,230,255,${0.95 * f})`);
       g.addColorStop(0.45, `rgba(180,150,240,${0.8 * f})`);
       g.addColorStop(1, `rgba(28,17,64,${0.9 * f})`);
-      ctx.fillStyle = g;
-      ctx.fillRect(0, 0, w, h);
+      octx.fillStyle = g;
+      octx.fillRect(0, 0, w, h);
       // a ring of waking light sweeping outward
-      ctx.globalCompositeOperation = 'lighter';
-      ctx.globalAlpha = f * 0.8;
-      ctx.strokeStyle = '#e6d1ff';
-      ctx.lineWidth = 3;
-      ctx.shadowColor = '#b48cff';
-      ctx.shadowBlur = 30;
-      ctx.beginPath();
-      ctx.arc(w / 2, h / 2, (1 - this.wake / 1.8) * Math.max(w, h) * 0.7 + 30, 0, TAU);
-      ctx.stroke();
-      ctx.globalAlpha = Math.min(1, f * 1.6);
-      ctx.textAlign = 'center';
-      ctx.font = '700 22px Cinzel, serif';
-      ctx.fillStyle = '#e6d1ff';
-      ctx.shadowBlur = 16;
-      ctx.fillText('the dream begins…', w / 2, h / 2 - 90);
-      ctx.restore();
+      octx.globalCompositeOperation = 'lighter';
+      octx.globalAlpha = f * 0.8;
+      octx.strokeStyle = '#e6d1ff';
+      octx.lineWidth = 3;
+      octx.shadowColor = '#b48cff';
+      octx.shadowBlur = 30;
+      octx.beginPath();
+      octx.arc(w / 2, h / 2, (1 - this.wake / 1.8) * Math.max(w, h) * 0.7 + 30, 0, TAU);
+      octx.stroke();
+      octx.globalAlpha = Math.min(1, f * 1.6);
+      octx.textAlign = 'center';
+      octx.font = '700 22px Cinzel, serif';
+      octx.fillStyle = '#e6d1ff';
+      octx.shadowBlur = 16;
+      octx.fillText('the dream begins…', w / 2, h / 2 - 90);
+      octx.restore();
     }
   }
 
